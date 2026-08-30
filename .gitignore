@@ -1,0 +1,11 @@
+target/
+bin/
+out/
+*.class
+dependency-reduced-pom.xml
+chat-*.log
+received_*
+peer-binary/
+.settings/
+.classpath
+.project
