@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Aperture — Live P2P Mesh</title>
+<style>
+  body { background: #0d0d0d; color: #eee; font-family: sans-serif; padding: 2rem; }
+  #status { font-size: 13px; color: #888; margin-bottom: 1rem; }
+  svg { background: #151515; border-radius: 12px; }
+  .node { fill: #4a9eff; }
+  .node-label { fill: #ccc; font-size: 11px; }
+  .edge-pending { stroke: #888; stroke-width: 2; stroke-dasharray: 2 2; }
+  .edge-direct { stroke: #3ecf8e; stroke-width: 2; }
+  .edge-relay { stroke: #f5a623; stroke-width: 2; stroke-dasharray: 4 3; }
+  #legend { margin-top: 0.75rem; font-size: 12px; color: #999; display: flex; gap: 16px; }
+  #legend span { display: inline-flex; align-items: center; gap: 6px; }
+  #legend .swatch { width: 16px; height: 2px; display: inline-block; }
+  #log { margin-top: 1rem; font-size: 12px; color: #999; max-height: 150px; overflow-y: auto; }
+</style>
+</head>
+<body>
+  <h2>Aperture — Live P2P Mesh</h2>
+  <div id="status">Connecting...</div>
+  <svg id="mesh" width="600" height="400" viewBox="0 0 600 400"></svg>
+  <div id="legend">
+    <span><span class="swatch" style="background:#888; border-bottom:2px dashed #888;"></span>in progress</span>
+    <span><span class="swatch" style="background:#3ecf8e;"></span>direct</span>
+    <span><span class="swatch" style="background:#f5a623; border-bottom:2px dashed #f5a623;"></span>relay</span>
+  </div>
+  <div id="log"></div>
+
+<script>
+  const nodes = new Map();
+  const edges = new Map();
+  const svg = document.getElementById('mesh');
+  const statusEl = document.getElementById('status');
+  const logEl = document.getElementById('log');
+
+  function getOrCreateNode(name) {
+    if (!nodes.has(name)) {
+      const angle = nodes.size * 0.9;
+      const r = 140;
+      const cx = 300 + r * Math.cos(angle);
+      const cy = 200 + r * Math.sin(angle);
+      nodes.set(name, { x: cx, y: cy });
+    }
+    return nodes.get(name);
+  }
+
+  function log(msg) {
+    const line = document.createElement('div');
+    line.textContent = new Date().toLocaleTimeString() + ' — ' + msg;
+    logEl.prepend(line);
+  }
+
+  function edgeClass(path) {
+    if (path === 'direct') return 'edge-direct';
+    if (path === 'relay') return 'edge-relay';
+    return 'edge-pending';
+  }
+
+  function render() {
+    svg.innerHTML = '';
+    for (const [key, edge] of edges) {
+      const a = nodes.get(edge.from);
+      const b = nodes.get(edge.to);
+      if (!a || !b) continue;
+      const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      line.setAttribute('x1', a.x); line.setAttribute('y1', a.y);
+      line.setAttribute('x2', b.x); line.setAttribute('y2', b.y);
+      line.setAttribute('class', edgeClass(edge.path));
+      svg.appendChild(line);
+    }
+    for (const [name, pos] of nodes) {
+      const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      circle.setAttribute('cx', pos.x); circle.setAttribute('cy', pos.y);
+      circle.setAttribute('r', 8);
+      circle.setAttribute('class', 'node');
+      svg.appendChild(circle);
+
+      const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      text.setAttribute('x', pos.x + 12); text.setAttribute('y', pos.y + 4);
+      text.setAttribute('class', 'node-label');
+      text.textContent = name;
+      svg.appendChild(text);
+    }
+  }
+
+  const ws = new WebSocket('ws://' + location.hostname + ':5001');
+
+  ws.onopen = () => { statusEl.textContent = 'Connected'; };
+  ws.onclose = () => { statusEl.textContent = 'Disconnected'; };
+  ws.onerror = () => { statusEl.textContent = 'Connection error'; };
+
+  ws.onmessage = (evt) => {
+    const data = JSON.parse(evt.data);
+    getOrCreateNode(data.from);
+    if (data.to) getOrCreateNode(data.to);
+
+    if (data.type === 'transfer_start') {
+      edges.set(data.from + '->' + data.to, { from: data.from, to: data.to, path: 'pending' });
+      log(data.from + ' -> ' + data.to + ' (starting)');
+    } else if (data.type === 'transfer_complete') {
+      for (const [key, edge] of edges) {
+        if (edge.from === data.from || edge.to === data.from) {
+          edge.path = data.path;
+        }
+      }
+      log(data.from + ' transfer complete (' + data.path + ')');
+      setTimeout(() => {
+        for (const key of edges.keys()) {
+          if (key.includes(data.from)) edges.delete(key);
+        }
+        render();
+      }, 4000);
+    }
+    render();
+  };
+</script>
+</body>
+</html>

@@ -19,6 +19,7 @@ public class MessageBroker {
     private final String queueUrl;
     private final ChatRoom chatRoom;
     private final String instanceId;
+    private MeshEventServer meshEventServer;
 
     public MessageBroker(String topicArn, ChatRoom chatRoom, String instanceId) {
         this.snsClient = SnsClient.create();
@@ -27,6 +28,10 @@ public class MessageBroker {
         this.chatRoom = chatRoom;
         this.instanceId = instanceId;
         this.queueUrl = createInstanceQueue();
+    }
+
+    public void setMeshEventServer(MeshEventServer meshEventServer) {
+        this.meshEventServer = meshEventServer;
     }
 
     private String createInstanceQueue() {
@@ -109,7 +114,7 @@ public class MessageBroker {
     }
 
     private void handleIncoming(String payload) {
-    	System.out.println("[MessageBroker] Received raw payload: " + payload);
+        System.out.println("[MessageBroker] Received raw payload: " + payload);
         String[] parts = payload.split("\\|", 5);
         String kind = parts[0];
 
@@ -124,6 +129,19 @@ public class MessageBroker {
             String target = parts[3];
             String content = parts.length > 4 ? parts[4] : "";
             chatRoom.deliverLocal(new Message(type, sender, target, content));
+        } else if (kind.equals("MESH")) {
+            if (meshEventServer == null) return;
+            String action = parts[1];
+            if (action.equals("START")) {
+                String from = parts[2];
+                String to = parts.length > 3 ? parts[3] : "";
+                meshEventServer.applyRemoteStart(from, to);
+            } else if (action.equals("COMPLETE")) {
+                String from = parts[2];
+                String to = parts.length > 3 ? parts[3] : "";
+                String path = parts.length > 4 ? parts[4] : "";
+                meshEventServer.applyRemoteComplete(from, to, path);
+            }
         }
     }
 
@@ -149,6 +167,28 @@ public class MessageBroker {
         Map<String, MessageAttributeValue> attrs = new HashMap<>();
         attrs.put("target", MessageAttributeValue.builder()
                 .dataType("String").stringValue(targetInstanceId).build());
+
+        snsClient.publish(PublishRequest.builder()
+                .topicArn(topicArn)
+                .message(payload)
+                .messageAttributes(attrs)
+                .build());
+    }
+
+    public void publishMeshStart(String from, String to) {
+        String payload = "MESH|START|" + from + "|" + safe(to);
+        publishToAll(payload);
+    }
+
+    public void publishMeshComplete(String from, String to, String path) {
+        String payload = "MESH|COMPLETE|" + from + "|" + safe(to) + "|" + safe(path);
+        publishToAll(payload);
+    }
+
+    private void publishToAll(String payload) {
+        Map<String, MessageAttributeValue> attrs = new HashMap<>();
+        attrs.put("target", MessageAttributeValue.builder()
+                .dataType("String").stringValue("broadcast").build());
 
         snsClient.publish(PublishRequest.builder()
                 .topicArn(topicArn)

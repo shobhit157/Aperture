@@ -7,8 +7,9 @@ public class ChatRoom {
 
     private final Map<String, ClientHandler> localClients = new ConcurrentHashMap<>();
     private final RedisClientRegistry registry;
-    private final MessageBroker broker; // null if SNS not configured
+    private final MessageBroker broker;
     private final String instanceId;
+    private MeshEventServer meshEventServer;
 
     public ChatRoom(RedisClientRegistry registry, String snsTopicArn, String instanceId) {
         this.registry = registry;
@@ -24,9 +25,16 @@ public class ChatRoom {
         }
     }
 
+    public void setMeshEventServer(MeshEventServer meshEventServer) {
+        this.meshEventServer = meshEventServer;
+        if (broker != null) {
+            broker.setMeshEventServer(meshEventServer);
+        }
+    }
+
     public void join(ClientHandler client) {
         localClients.put(client.getUsername(), client);
-        registry.register(client.getUsername(), client.getEndpointId(), instanceId);
+        registry.register(client.getUsername(), client.getEndpointId(), client.getRelayUrl(), instanceId);
     }
 
     public void leave(ClientHandler client) {
@@ -38,7 +46,7 @@ public class ChatRoom {
         if (broker != null) {
             broker.publishBroadcast(message);
         } else {
-            deliverLocal(message); // single-instance: just deliver directly
+            deliverLocal(message);
         }
     }
 
@@ -68,5 +76,32 @@ public class ChatRoom {
 
     public String getEndpointId(String username) {
         return registry.getEndpointId(username);
+    }
+
+    public String getRelayUrl(String username) {
+        return registry.getRelayUrl(username);
+    }
+
+    public int getLocalClientCount() {
+        return localClients.size();
+    }
+
+    // Mesh events go through exactly ONE path: if SNS is configured, publish only
+    // (the round-trip back through our own SQS subscription applies it locally too,
+    // exactly once, same as every other pod). If single-instance, apply directly.
+    public void meshTransferStart(String from, String to) {
+        if (broker != null) {
+            broker.publishMeshStart(from, to);
+        } else if (meshEventServer != null) {
+            meshEventServer.applyRemoteStart(from, to);
+        }
+    }
+
+    public void meshTransferComplete(String from, String to, String path) {
+        if (broker != null) {
+            broker.publishMeshComplete(from, to, path);
+        } else if (meshEventServer != null) {
+            meshEventServer.applyRemoteComplete(from, to, path);
+        }
     }
 }

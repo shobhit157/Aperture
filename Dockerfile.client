@@ -4,4 +4,4 @@ COPY target/Network_lab-0.0.1-SNAPSHOT.jar app.jar
 COPY peer-binary/peer /app/peer-binary/peer
 RUN chmod +x /app/peer-binary/peer
 ENV PEER_BINARY_PATH=/app/peer-binary/peer
-ENTRYPOINT ["java", "-cp", "app.jar", "com.shobhit.Network_lab.Client"]t
+ENTRYPOINT ["java", "-cp", "app.jar", "com.shobhit.Network_lab.Client"]

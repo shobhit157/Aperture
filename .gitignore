@@ -9,3 +9,6 @@ peer-binary/
 .settings/
 .classpath
 .project
+bot_large.bin
+bot_medium.bin
+bot_small.txt

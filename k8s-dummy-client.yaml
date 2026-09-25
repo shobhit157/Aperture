@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dummy-client
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dummy-client
+  template:
+    metadata:
+      labels:
+        app: dummy-client
+    spec:
+      containers:
+        - name: dummy-client
+          image: shobhit3718/dummy-client:latest
+          args: ["13.233.32.101","30000", "--bot"]
+          env:
+            - name: BOT_FILE_SIZE_MULTIPLIER
+              value: "1"
