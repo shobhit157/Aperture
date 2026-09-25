@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signaling-server
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: signaling-server
+  template:
+    metadata:
+      labels:
+        app: signaling-server
+    spec:
+      containers:
+        - name: signaling-server
+          image: signaling-server:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5000
+            - containerPort: 9090
+          env:
+            - name: REDIS_HOST
+              value: "redis"
+            - name: SNS_TOPIC_ARN
+              value: "arn:aws:sns:ap-south-1:092205142105:chat-events-1"
+            - name: AWS_REGION
+              value: "ap-south-1"
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: signaling-server
+spec:
+  type: NodePort
+  selector:
+    app: signaling-server
+  ports:
+    - name: chat
+      port: 5000
+      targetPort: 5000
+      nodePort: 30000
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+      nodePort: 30090

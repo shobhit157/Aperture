@@ -1,6 +1,5 @@
 package com.shobhit.Network_lab;
 
-
 import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
 
@@ -12,9 +11,10 @@ public class RedisClientRegistry {
         this.pool = new JedisPool(new JedisPoolConfig(), host, port);
     }
 
-    public void register(String username, String endpointId, String instanceId) {
+    public void register(String username, String endpointId, String relayUrl, String instanceId) {
         try (var jedis = pool.getResource()) {
             jedis.hset("client:" + username, "endpointId", endpointId == null ? "" : endpointId);
+            jedis.hset("client:" + username, "relayUrl", relayUrl == null ? "" : relayUrl);
             jedis.hset("client:" + username, "instanceId", instanceId);
             jedis.sadd("online_users", username);
         }
@@ -33,9 +33,21 @@ public class RedisClientRegistry {
         }
     }
 
+    public String getRelayUrl(String username) {
+        try (var jedis = pool.getResource()) {
+            return jedis.hget("client:" + username, "relayUrl");
+        }
+    }
+
     public String getInstanceId(String username) {
         try (var jedis = pool.getResource()) {
             return jedis.hget("client:" + username, "instanceId");
+        }
+    }
+
+    public long getGlobalOnlineCount() {
+        try (var jedis = pool.getResource()) {
+            return jedis.scard("online_users");
         }
     }
 
