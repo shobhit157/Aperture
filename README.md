@@ -132,8 +132,4 @@ docs/
 ├── decisions/        — tradeoffs made, and why
 ├── future-plans/     — designed but not yet built
 └── learning-notes/   — the underlying concepts this project draws on
-```
 
-Every fix in this project follows the same discipline: find the real
-cause with evidence before writing the fix, and write down what was
-ruled out along the way — not just what worked.
