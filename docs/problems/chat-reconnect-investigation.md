@@ -1,15 +1,32 @@
 # Chat Connection Reconnects — Investigation and Future Direction
 
+> [!NOTE]
+> **Status as of the reconnect redesign work (see `chat-reconnect-plan.md` and
+> `chat-reconnect-steps-1-2.md` in `docs/fixes/`):** this investigation correctly
+> ruled out several causes and correctly identified genuine network instability
+> as a real factor. It did not yet know about a separate, confirmed server-side
+> bug found afterward — cleanup running by username instead of by session,
+> which let a dying old connection erase a live, newer connection's registration.
+> That bug has since been fixed and verified on real reconnects. Given that,
+> some of the disconnect patterns described below may have been this bug
+> compounding with real network instability, not network instability alone.
+> This document is being kept as-is for its investigation trail, but its
+> conclusions should be read alongside the newer, more complete picture. The
+> reconnect story is still under active development — steps 3 to 5 of the
+> redesign plan remain unbuilt, and further causes may still surface.
+
 > [!WARNING]
 > **Observed:** Admin's and bots' chat connections to the signaling server
 > intermittently drop and reconnect, with two different underlying errors
 > (`Connection reset` and `Connection refused`), at unrelated times.
 >
-> **Status:** root cause not fully identified. Several plausible causes were
-> ruled out with direct evidence. The remaining explanation is genuine,
-> external network instability between the client machines and the EC2
-> server — not a bug in the reconnect logic itself, which is working
-> correctly as designed.
+> **Status:** root cause not fully identified at the time of this
+> investigation. Several plausible causes were ruled out with direct evidence.
+> The remaining explanation identified here is genuine, external network
+> instability between the client machines and the EC2 server — not a bug in
+> the reconnect logic itself, which is working correctly as designed. A
+> separate, genuine code defect was found and fixed afterward; see the note
+> above.
 
 ---
 
@@ -151,13 +168,15 @@ clients and server on physically separate infrastructure.
 ## 4. Current conclusion
 
 > [!WARNING]
-> No single, fixable root cause was identified. The most likely
-> explanation is genuine, intermittent network instability along the real
-> path between client machines (a home network, a separate local
-> Kubernetes cluster) and the EC2 server — consistent with other evidence
-> gathered earlier in this project (symmetric-NAT-like behavior, elevated
-> relay latency). The existing reconnect logic is a correct, working
-> response to this reality, not a workaround for a code defect.
+> No single, fixable root cause was identified **at the time of this
+> investigation**. The most likely explanation is genuine, intermittent
+> network instability along the real path between client machines (a home
+> network, a separate local Kubernetes cluster) and the EC2 server —
+> consistent with other evidence gathered earlier in this project
+> (symmetric-NAT-like behavior, elevated relay latency). The existing
+> reconnect logic is a correct, working response to this reality, not a
+> workaround for a code defect. **A separate, genuine code defect was found
+> and fixed afterward — see the status note above.**
 
 ---
 
@@ -232,17 +251,16 @@ own proper design pass first.
 
 ## 7. Immediate, smaller mitigations available now, independent of the migration
 
-- [ ] Fix the `System.err` visibility gap so any future exception here is
-      actually observable, rather than silently lost.
-- [ ] Consider a lightweight keepalive on the chat TCP socket (a small
-      periodic message) to prevent idle-connection timeouts specifically
-      — this would not address a genuine `Connection refused` scenario,
-      but could reduce how often an otherwise-healthy, idle connection
-      gets silently reset by an intermediate NAT/router.
+- [x] Fix the `System.err` visibility gap so any future exception here is
+      actually observable, rather than silently lost. *(Done as part of
+      the reconnect redesign's step 1 — errors now print to `System.out`.)*
+- [x] Consider a lightweight keepalive on the chat TCP socket. *(Done and
+      verified — see `chat-heartbeat-fix.md`.)*
 - [ ] Fix the reconnect attempt counter's display, which currently shows
       "attempt 0/5" on the first failure of a fresh episode due to the
       reset happening before the increment is next applied — cosmetic
-      only, does not affect actual retry behavior.
+      only, does not affect actual retry behavior. Still open, planned
+      for step 3 of the reconnect redesign.
 
 ---
 
@@ -251,6 +269,10 @@ own proper design pass first.
 - Builds on the transfer-state accuracy work (`transfer-state-vs-mesh-state.md`)
   — the same principle applies: don't guess at causes, gather real
   evidence before concluding.
+- Superseded in part by the reconnect redesign work: see
+  `chat-reconnect-plan.md` and `chat-reconnect-steps-1-2.md` in
+  `docs/fixes/`, which found and fixed a genuine session-cleanup defect
+  this investigation did not know about at the time.
 - The Iroh-migration idea, if pursued, should get its own dedicated
   future-plan document once the open design questions in Section 6 are
   worked through, following the same pattern as
