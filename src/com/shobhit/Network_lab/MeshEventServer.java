@@ -15,13 +15,9 @@ import java.util.concurrent.TimeUnit;
 
 public class MeshEventServer extends WebSocketServer {
 
-    // How long a transfer can sit "pending" with no completion report before
-    // we give up on it and mark it failed. This is a fixed guess, not
-    // progress-aware — a genuinely slow but healthy large transfer could
-    // theoretically get marked failed if it takes longer than this. A
-    // progress-aware version (resetting the timer on live progress updates)
-    // is the more accurate follow-up fix.
-    private static final long PENDING_TIMEOUT_SECONDS = 60;
+    private static final long STALLED_AFTER_SECONDS = 20;
+    private static final long FAILED_AFTER_SECONDS = 40;
+    private static final long CHECK_INTERVAL_SECONDS = 5;
 
     private final Set<WebSocket> connections = new CopyOnWriteArraySet<>();
     private final Map<String, TransferInfo> activeTransfers = new ConcurrentHashMap<>();
@@ -35,11 +31,13 @@ public class MeshEventServer extends WebSocketServer {
         String from;
         String to;
         String path;
+        volatile long lastSeenMillis;
 
         TransferInfo(String from, String to, String path) {
             this.from = from;
             this.to = to;
             this.path = path;
+            this.lastSeenMillis = System.currentTimeMillis();
         }
     }
 
@@ -67,37 +65,57 @@ public class MeshEventServer extends WebSocketServer {
     @Override
     public void onStart() {
         System.out.println("[MeshEventServer] Listening for dashboard connections on port " + getPort());
+        scheduler.scheduleAtFixedRate(this::checkForStaleTransfers,
+                CHECK_INTERVAL_SECONDS, CHECK_INTERVAL_SECONDS, TimeUnit.SECONDS);
     }
 
-    public void applyRemoteStart(String from, String to) {
-        String id = from + "->" + to + "->" + System.nanoTime();
-        activeTransfers.put(id, new TransferInfo(from, to, "pending"));
-        broadcastSnapshot();
+    private void checkForStaleTransfers() {
+        long now = System.currentTimeMillis();
+        boolean changed = false;
 
-        // Safety net: if this transfer never reports completion (disconnect,
-        // crash, or any other failure), mark it failed and clear it — so the
-        // mesh never gets permanently stuck on a transfer that's simply never
-        // going to finish.
-        scheduler.schedule(() -> {
-            TransferInfo info = activeTransfers.get(id);
-            if (info != null && info.path.equals("pending")) {
+        for (Map.Entry<String, TransferInfo> entry : activeTransfers.entrySet()) {
+            TransferInfo info = entry.getValue();
+            if (info.path.equals("failed")) continue;
+
+            long silentFor = (now - info.lastSeenMillis) / 1000;
+
+            if (silentFor >= FAILED_AFTER_SECONDS) {
                 info.path = "failed";
-                System.out.println("[MeshEventServer] Transfer timed out: " + info.from + " -> " + info.to);
-                broadcastSnapshot();
+                System.out.println("[MeshEventServer] Transfer failed (silent " + silentFor + "s): "
+                        + info.from + " -> " + info.to);
+                changed = true;
+                String id = entry.getKey();
                 scheduler.schedule(() -> {
                     activeTransfers.remove(id);
                     broadcastSnapshot();
                 }, 5, TimeUnit.SECONDS);
+            } else if (silentFor >= STALLED_AFTER_SECONDS && !info.path.equals("stalled")) {
+                info.path = "stalled";
+                changed = true;
             }
-        }, PENDING_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
+
+        if (changed) {
+            broadcastSnapshot();
+        }
+    }
+
+    public void applyRemoteStart(String from, String to, String transferId) {
+        if (transferId == null || transferId.isBlank()) {
+            transferId = from + "->" + to + "->" + System.nanoTime();
+        }
+        activeTransfers.put(transferId, new TransferInfo(from, to, "pending"));
+        broadcastSnapshot();
     }
 
     public void applyRemoteComplete(String from, String to, String path) {
         for (Map.Entry<String, TransferInfo> entry : activeTransfers.entrySet()) {
             TransferInfo info = entry.getValue();
             boolean toMatches = to.isEmpty() || info.to.equals(to);
-            if (info.from.equals(from) && toMatches && info.path.equals("pending")) {
+            if (info.from.equals(from) && toMatches
+                    && (info.path.equals("pending") || info.path.equals("stalled"))) {
                 info.path = path;
+                info.lastSeenMillis = System.currentTimeMillis();
                 broadcastSnapshot();
                 String id = entry.getKey();
                 scheduler.schedule(() -> {
@@ -107,6 +125,54 @@ public class MeshEventServer extends WebSocketServer {
                 return;
             }
         }
+    }
+
+    public void applyRemoteProgress(String transferId, String pct) {
+        TransferInfo info = activeTransfers.get(transferId);
+        if (info == null) return;
+        info.lastSeenMillis = System.currentTimeMillis();
+        if (info.path.equals("stalled")) {
+            info.path = "pending";
+            broadcastSnapshot();
+        }
+    }
+
+    public void applyRemoteFailed(String from, String to, String reason) {
+        for (Map.Entry<String, TransferInfo> entry : activeTransfers.entrySet()) {
+            TransferInfo info = entry.getValue();
+            boolean toMatches = to.isEmpty() || info.to.equals(to);
+            if (info.from.equals(from) && toMatches && !info.path.equals("failed")) {
+                info.path = "failed";
+                System.out.println("[MeshEventServer] Transfer failed (explicit): "
+                        + info.from + " -> " + info.to + " (" + reason + ")");
+                broadcastSnapshot();
+                String id = entry.getKey();
+                scheduler.schedule(() -> {
+                    activeTransfers.remove(id);
+                    broadcastSnapshot();
+                }, 5, TimeUnit.SECONDS);
+                return;
+            }
+        }
+    }
+
+    // Fix 4: a LIVE path update, matched by transfer ID directly. Fires at
+    // connection start and again on any mid-transfer migration (e.g. direct
+    // falling back to relay). Only updates the color while the transfer is
+    // genuinely ongoing ("pending" or "stalled") — never overwrites a
+    // transfer that has already reached a terminal state (failed, or
+    // already completed via applyRemoteComplete), since this is purely a
+    // visual indicator, not a completion signal. Also resets lastSeenMillis,
+    // since a path confirmation is itself proof the transfer is alive —
+    // same reasoning as applyRemoteProgress.
+    public void applyConnectionPath(String transferId, String path) {
+        TransferInfo info = activeTransfers.get(transferId);
+        if (info == null) return;
+        if (!info.path.equals("pending") && !info.path.equals("stalled")) return;
+
+        info.path = path;
+        info.lastSeenMillis = System.currentTimeMillis();
+        broadcastSnapshot();
     }
 
     private String buildSnapshotJson() {

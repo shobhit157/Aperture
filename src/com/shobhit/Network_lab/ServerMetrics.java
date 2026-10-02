@@ -14,6 +14,12 @@ public class ServerMetrics {
     public void userLeft()    { connectedUsers.decrementAndGet(); totalLeaves.incrementAndGet(); }
     public void messageSent() { totalMessages.incrementAndGet(); }
 
+    // Step 2: a session that ends without having been the current owner of
+    // its username (a zombie whose cleanup got superseded) still needs the
+    // live count corrected, but it was never really "seen leaving" from
+    // the chat's point of view, so totalLeaves is untouched.
+    public void sessionEnded() { connectedUsers.decrementAndGet(); }
+
     public int  getConnectedUsers() { return connectedUsers.get(); }
     public long getTotalMessages()  { return totalMessages.get(); }
     public long getTotalJoins()     { return totalJoins.get(); }

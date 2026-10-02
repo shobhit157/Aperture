@@ -114,33 +114,56 @@ public class MessageBroker {
     }
 
     private void handleIncoming(String payload) {
-        System.out.println("[MessageBroker] Received raw payload: " + payload);
-        String[] parts = payload.split("\\|", 5);
-        String kind = parts[0];
+        if (!payload.startsWith("MESH|PROGRESS") && !payload.startsWith("MESH|CONNPATH")) {
+            System.out.println("[MessageBroker] Received raw payload: " + payload);
+        }
+
+        int firstSep = payload.indexOf('|');
+        if (firstSep < 0) return;
+        String kind = payload.substring(0, firstSep);
+        String rest = payload.substring(firstSep + 1);
 
         if (kind.equals("BCAST")) {
-            MessageType type = MessageType.valueOf(parts[1]);
-            String sender = parts[2];
-            String content = parts.length > 3 ? parts[3] : "";
+            String[] parts = rest.split("\\|", 3);
+            MessageType type = MessageType.valueOf(parts[0]);
+            String sender = parts[1];
+            String content = parts.length > 2 ? parts[2] : "";
             chatRoom.deliverLocal(new Message(type, sender, content));
         } else if (kind.equals("TGT")) {
-            MessageType type = MessageType.valueOf(parts[1]);
-            String sender = parts[2];
-            String target = parts[3];
-            String content = parts.length > 4 ? parts[4] : "";
+            String[] parts = rest.split("\\|", 4);
+            MessageType type = MessageType.valueOf(parts[0]);
+            String sender = parts[1];
+            String target = parts[2];
+            String content = parts.length > 3 ? parts[3] : "";
             chatRoom.deliverLocal(new Message(type, sender, target, content));
         } else if (kind.equals("MESH")) {
             if (meshEventServer == null) return;
-            String action = parts[1];
+            String[] parts = rest.split("\\|");
+            String action = parts[0];
             if (action.equals("START")) {
-                String from = parts[2];
-                String to = parts.length > 3 ? parts[3] : "";
-                meshEventServer.applyRemoteStart(from, to);
+                String from = parts[1];
+                String to = parts.length > 2 ? parts[2] : "";
+                String transferId = parts.length > 3 ? parts[3] : "";
+                meshEventServer.applyRemoteStart(from, to, transferId);
             } else if (action.equals("COMPLETE")) {
-                String from = parts[2];
-                String to = parts.length > 3 ? parts[3] : "";
-                String path = parts.length > 4 ? parts[4] : "";
+                String from = parts[1];
+                String to = parts.length > 2 ? parts[2] : "";
+                String path = parts.length > 3 ? parts[3] : "";
                 meshEventServer.applyRemoteComplete(from, to, path);
+            } else if (action.equals("PROGRESS")) {
+                String transferId = parts[1];
+                String pct = parts.length > 2 ? parts[2] : "0";
+                meshEventServer.applyRemoteProgress(transferId, pct);
+            } else if (action.equals("FAILED")) {
+                String from = parts[1];
+                String to = parts.length > 2 ? parts[2] : "";
+                String reason = parts.length > 3 ? parts[3] : "unknown";
+                meshEventServer.applyRemoteFailed(from, to, reason);
+            } else if (action.equals("CONNPATH")) {
+                // Fix 4: a LIVE path update, keyed by transfer ID directly.
+                String transferId = parts[1];
+                String path = parts.length > 2 ? parts[2] : "unknown";
+                meshEventServer.applyConnectionPath(transferId, path);
             }
         }
     }
@@ -175,13 +198,30 @@ public class MessageBroker {
                 .build());
     }
 
-    public void publishMeshStart(String from, String to) {
-        String payload = "MESH|START|" + from + "|" + safe(to);
+    public void publishMeshStart(String from, String to, String transferId) {
+        String payload = "MESH|START|" + from + "|" + safe(to) + "|" + safe(transferId);
         publishToAll(payload);
     }
 
     public void publishMeshComplete(String from, String to, String path) {
         String payload = "MESH|COMPLETE|" + from + "|" + safe(to) + "|" + safe(path);
+        publishToAll(payload);
+    }
+
+    public void publishMeshProgress(String transferId, String pct) {
+        String payload = "MESH|PROGRESS|" + transferId + "|" + safe(pct);
+        publishToAll(payload);
+    }
+
+    public void publishMeshFailed(String from, String to, String reason) {
+        String payload = "MESH|FAILED|" + from + "|" + safe(to) + "|" + safe(reason);
+        publishToAll(payload);
+    }
+
+    // Fix 4: a LIVE path update, broadcast to all pods so every pod's
+    // mesh state stays in sync, mirroring publishMeshProgress above.
+    public void publishConnectionPath(String transferId, String path) {
+        String payload = "MESH|CONNPATH|" + transferId + "|" + safe(path);
         publishToAll(payload);
     }
 

@@ -1,5 +1,6 @@
 package com.shobhit.Network_lab;
 
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -33,13 +34,93 @@ public class ChatRoom {
     }
 
     public void join(ClientHandler client) {
-        localClients.put(client.getUsername(), client);
-        registry.register(client.getUsername(), client.getEndpointId(), client.getRelayUrl(), instanceId);
+        String user = client.getUsername();
+
+        // Step 1 (measure only, kept): report when a second session for
+        // the same name shows up while an older one is still registered.
+        ClientHandler previous = localClients.put(user, client);
+        if (previous != null && previous != client) {
+            System.out.println("[SESSION] overlap user=" + user
+                    + " oldSession=" + previous.getSessionId()
+                    + " newSession=" + client.getSessionId()
+                    + " (same pod)");
+        }
+        try {
+            String registeredOn = registry.getInstanceId(user);
+            String registeredSession = registry.getSessionId(user);
+            if (registeredOn != null && !registeredOn.equals(instanceId)) {
+                System.out.println("[SESSION] overlap user=" + user
+                        + " newSession=" + client.getSessionId()
+                        + " registeredOnPod=" + registeredOn
+                        + " registeredSession=" + registeredSession
+                        + " thisPod=" + instanceId
+                        + " (other pod)");
+            }
+        } catch (Exception e) {
+            System.out.println("[SESSION] overlap check failed: " + e.getMessage());
+        }
+
+        // Step 2 + 4: record, expiry and online entry written in one
+        // atomic step. The session ID travels with it, so a later
+        // unregister can check whether it's still the current one.
+        registry.register(user, client.getEndpointId(), client.getRelayUrl(), instanceId, client.getSessionId());
+
+        // Step 4: instant takeover on the same pod. MUST come after
+        // register(): if the old session were ended first, its cleanup
+        // would still see itself as owner, delete the record, and announce
+        // a false "left the chat". Runs on its own thread so a write into a
+        // dead socket can never stall the new session's join. Old sessions
+        // on OTHER pods are caught by their own 10s ownership check.
+        if (previous != null && previous != client) {
+            String newSessionId = client.getSessionId();
+            Thread t = new Thread(() -> previous.supersede(newSessionId),
+                    "supersede-" + previous.getSessionId());
+            t.setDaemon(true);
+            t.start();
+        }
     }
 
-    public void leave(ClientHandler client) {
-        localClients.remove(client.getUsername());
-        registry.unregister(client.getUsername());
+    // Step 2: returns true only if this call was the genuine, current
+    // owner of the username (Redis's check-and-delete succeeded). Returns
+    // false if a newer session had already taken over, in which case this
+    // call did nothing to the shared state. The local map entry is removed
+    // defensively either way, but only if it's still this exact handler —
+    // never a newer one that already replaced it.
+    public boolean leave(ClientHandler client) {
+        String user = client.getUsername();
+
+        localClients.remove(user, client);
+
+        boolean wasOwner = registry.unregister(user, client.getSessionId());
+
+        System.out.println("[SESSION] cleanup user=" + user
+                + " session=" + client.getSessionId()
+                + " wasOwner=" + wasOwner
+                + " thisPod=" + instanceId);
+
+        return wasOwner;
+    }
+
+    // Step 4: the session Redis currently records as owner of this
+    // username, or null if none. Used by ClientHandler's ownership check.
+    public String getRegisteredSessionId(String username) {
+        return registry.getSessionId(username);
+    }
+
+    // Step 4: renew this session's presence (owner only). Called on PING.
+    public void heartbeat(ClientHandler client) {
+        int result = registry.heartbeat(client.getUsername(), client.getEndpointId(),
+                client.getRelayUrl(), instanceId, client.getSessionId());
+        if (result == 2) {
+            System.out.println("[SESSION] user=" + client.getUsername()
+                    + " session=" + client.getSessionId()
+                    + " registry record was missing, re-registered");
+        }
+    }
+
+    // Step 5: everyone online across all pods.
+    public List<String> getOnlineUsers() {
+        return registry.getOnlineUsers();
     }
 
     public void broadcast(Message message, ClientHandler sender) {
@@ -86,14 +167,11 @@ public class ChatRoom {
         return localClients.size();
     }
 
-    // Mesh events go through exactly ONE path: if SNS is configured, publish only
-    // (the round-trip back through our own SQS subscription applies it locally too,
-    // exactly once, same as every other pod). If single-instance, apply directly.
-    public void meshTransferStart(String from, String to) {
+    public void meshTransferStart(String from, String to, String transferId) {
         if (broker != null) {
-            broker.publishMeshStart(from, to);
+            broker.publishMeshStart(from, to, transferId);
         } else if (meshEventServer != null) {
-            meshEventServer.applyRemoteStart(from, to);
+            meshEventServer.applyRemoteStart(from, to, transferId);
         }
     }
 
@@ -102,6 +180,30 @@ public class ChatRoom {
             broker.publishMeshComplete(from, to, path);
         } else if (meshEventServer != null) {
             meshEventServer.applyRemoteComplete(from, to, path);
+        }
+    }
+
+    public void meshTransferProgress(String transferId, String pct) {
+        if (broker != null) {
+            broker.publishMeshProgress(transferId, pct);
+        } else if (meshEventServer != null) {
+            meshEventServer.applyRemoteProgress(transferId, pct);
+        }
+    }
+
+    public void meshTransferFailed(String from, String to, String reason) {
+        if (broker != null) {
+            broker.publishMeshFailed(from, to, reason);
+        } else if (meshEventServer != null) {
+            meshEventServer.applyRemoteFailed(from, to, reason);
+        }
+    }
+
+    public void meshConnectionPath(String transferId, String path) {
+        if (broker != null) {
+            broker.publishConnectionPath(transferId, path);
+        } else if (meshEventServer != null) {
+            meshEventServer.applyConnectionPath(transferId, path);
         }
     }
 }
