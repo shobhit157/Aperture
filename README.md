@@ -1,124 +1,152 @@
 # Aperture
 
-A peer-to-peer chat and file-transfer platform, with a live dashboard
-that shows exactly how each transfer actually happened — direct,
-relayed, or failed — instead of just whether it eventually finished.
+**A learning lab for peer-to-peer connectivity and reliability.**
+
+Aperture is a small P2P system I built to understand how peer-to-peer connections really work with [Iroh](https://iroh.computer): when two machines can connect directly, when they need a relay, how reliable that is on real networks, and which parts of a "decentralized" system still need a central server. Chat and file transfer are the traffic that drives the experiments; the interesting part is watching how the connections behave, break, and recover.
+
+<!-- TODO: add a screenshot or GIF of the mesh view here -->
 
 ---
 
-## What Aperture does
+## At a glance
 
-Two users chat and send files to each other. A central server helps them
-find one another, but the files themselves never pass through it — once
-two peers are introduced, the actual bytes travel directly between them
-whenever possible, falling back to a relay only when a direct connection
-genuinely can't be established.
-
-```text
-     signaling server
-    (finds peers, never
-     touches file data)
-       ↙          ↘
-   Peer A ────────── Peer B
-        direct or relay
-```
-
-This is the same architectural shape used by real, production P2P
-systems — the signaling/discovery layer is centralized for simplicity,
-while the actual data transfer is decentralized for privacy, speed, and
-to avoid the server ever becoming a bandwidth bottleneck.
+- **Control plane:** Java signaling server running as multiple pods on k3s, with Redis for presence and AWS SNS/SQS between pods
+- **Data plane:** Rust `peer-app` on Iroh — direct connections via hole punching, relay fallback
+- **Reliability work:** reconnects across server pods, heartbeat-based failure detection, crash-safe presence — each investigated and documented with before/after evidence
+- **Observability:** live mesh view of transfers (direct vs relay), Prometheus metrics, Grafana
 
 ---
 
-## The three things Aperture is actually built to prove
+## Questions I'm exploring
 
-**1. Real peer-to-peer transfer works, even across real distance and real
-NATs.** Not simulated on one machine — tested with bots on genuinely
-separate networks.
-
-**2. A live dashboard can tell the truth about what's happening, not
-just guess.** Early versions of the mesh view inferred failure from
-silence — "no update in 60 seconds, must be dead." That produced false
-positives on transfers that were simply slow. The current version tracks
-real signals — explicit failure events and live progress updates —
-and only reports what it actually knows.
-
-**3. Distributed systems fail in specific, findable ways, and the fixes
-are documented, not just patched and forgotten.** Every real bug this
-project hit — a stale relay assignment, a message-parsing regression, an
-intermittent TCP disconnect — got investigated with actual evidence
-before being fixed. That investigation trail lives in `docs/`.
+- **How does P2P actually connect?** How do two machines behind different routers reach each other, and when does that fail?
+- **How reliable is it on real networks?** WiFi drops, NATs, machines on different networks — not just localhost.
+- **Direct vs relay:** how often is a relay needed, and what does it cost in speed and setup time?
+- **What still has to be central?** Discovery, presence and coordination — and what goes wrong when those are spread over several servers.
+- **How do you know what's really happening?** Reporting what the system actually observed, instead of guessing from silence.
 
 ---
 
-## Architecture
+## How it works
+
+A central server helps peers find each other. The file bytes don't go through it: once two peers are introduced, they connect directly when possible, or through a relay when not.
+
 ```mermaid
 flowchart TB
-    subgraph CP["Control plane — Java signaling server"]
-        S["Signaling server"]
-        Redis[("Redis<br/>presence, endpoints")]
-        SNS["SNS / SQS<br/>cross-pod routing"]
-        Mesh["MeshEventServer<br/>tracks transfer state"]
+    S["Signaling server<br/>(helps peers find each other,<br/>never touches file data)"]
+    A["Peer A"]
+    B["Peer B"]
+    S -. "introduces" .-> A
+    S -. "introduces" .-> B
+    A <== "direct or relay" ==> B
+```
+
+### Architecture
+
+```mermaid
+flowchart TB
+    subgraph CP["Control plane — Java signaling server (k3s)"]
+        S["Signaling server pods"]
+        Redis[("Redis<br/>presence, sessions, endpoints")]
+        SNS["SNS / SQS<br/>messages between pods"]
+        Mesh["MeshEventServer<br/>live transfer view"]
+        Prom["Prometheus + Grafana"]
         S --- Redis
         S --- SNS
         S --- Mesh
+        S --- Prom
     end
 
-    BotA["Bot A<br/>Client.java + peer-app"]
-    BotB["Bot B<br/>Client.java + peer-app"]
+    A["Client A<br/>Java client + peer-app"]
+    B["Client B<br/>Java client + peer-app"]
 
-    BotA -- "1. join, register endpoint" --> S
-    BotB -- "1. join, register endpoint" --> S
-    BotA -- "2. request transfer to B" --> S
-    S -- "3. hands each peer<br/>the other's connection info" --> BotB
+    A -- "join, heartbeat" --> S
+    B -- "join, heartbeat" --> S
+    A -- "request transfer" --> S
+    S -- "share connection info" --> B
 
     subgraph DP["Data plane — Rust + Iroh"]
         direction LR
-        Direct["Direct connection<br/>NAT hole-punch"]
+        Direct["Direct connection<br/>(hole punching)"]
         Relay["Relay fallback"]
     end
 
-    BotA == "4. Iroh attempts" ==> Direct
+    A == "Iroh tries" ==> Direct
     Direct -. "if it fails" .-> Relay
-    Direct == "file bytes" ==> BotB
-    Relay -. "file bytes" .-> BotB
-
-    BotA -- "5. reports outcome" --> S
-    BotB -- "5. reports outcome" --> S
-
+    Direct == "file bytes" ==> B
+    Relay -. "file bytes" .-> B
 ```
 
-- **Control plane (Java)** — a TCP-based signaling server. Tracks who's
-  online (Redis), routes messages across multiple server instances
-  (AWS SNS/SQS), and hands two peers each other's connection details so
-  they can talk directly.
-- **Data plane (Rust, via Iroh)** — each client spawns a `peer-app`
-  subprocess built on [Iroh](https://iroh.computer), a QUIC-based P2P
-  library. This is what actually attempts the direct connection, falls
-  back to relay, and streams the file.
-- **Mesh dashboard** — a live WebSocket-driven view of every active
-  transfer: which peers, which path (direct/relay), and real-time
-  progress.
-
+More detail in `docs/architecture/`.
 
 ---
 
-## What's real vs. what's planned
+## What I built vs. what Iroh provides
 
-**Built and verified:**
-- Direct P2P connection with NAT hole-punching, relay fallback
-- Real cross-region transfer, hash-verified
-- Atomic file writes — a failed transfer never leaves a corrupted file
-- Explicit, immediate failure reporting (not inferred from silence)
-- Cross-pod mesh state sync via SNS/SQS
-- An application-level heartbeat that measurably extends chat connection
-  stability (verified with a controlled before/after comparison)
+| Iroh provides | I built |
+|---|---|
+| Peer identity and encrypted QUIC connections | The signaling server: discovery, presence, endpoint exchange |
+| Hole punching and relay fallback | Multi-pod coordination with Redis and SNS/SQS |
+| Public relay servers (n0) | The file-transfer protocol on top of Iroh streams (headers, progress, atomic writes, hash checks) |
+| | Session handling and reconnect logic across server pods |
+| | Failure reporting, the mesh view, metrics |
+| | Deployment on k3s, Docker images, test bots |
 
-**Documented, not yet built** — see `docs/future-plans/`:
-- Self-hosted Iroh relay (reduce dependency on n0's shared infrastructure)
-- Swarm-style, many-to-many file distribution
-- DHT-based peer discovery
-- Moving the chat channel onto Iroh/QUIC instead of plain TCP
+---
+
+## What works so far
+
+- Direct P2P transfers with hole punching, and relay fallback when that fails
+- Transfers between machines on different networks, verified with file hashes
+- Failed transfers don't leave half-written files
+- Transfer failures are reported when they happen, not guessed from silence
+- Several server pods sharing state through Redis and SNS/SQS
+- Chat reconnects across server pods: dropped connections are detected by a heartbeat, replaced sessions clean themselves up, and a crashed server pod doesn't leave users stuck as "online"
+
+These work in my test setup (a few peers, one cloud machine, my laptop). They haven't been tested at any real scale.
+
+---
+
+## What I found so far
+
+Each of these has a write-up in `docs/problems/` and `docs/fixes/`:
+
+- **TCP connections can die silently.** After a network drop, the server kept a dead session alive for **1200+ seconds**. With an application heartbeat, drops are now detected in **~60 s**, and a replaced session is removed in **~0–13 s** once the client reconnects.
+- **Cleanup across servers can delete the wrong thing.** One pod's cleanup erased a user that was still connected through another pod. Fixed by only deleting what the session still owns.
+- **"Online" has to expire on its own.** When a server pod crashes, nothing is left to mark its users offline. Presence is now a lease renewed by heartbeats; after a forced pod crash, the stale user disappeared within ~75 s.
+- **Guessing failure from silence gives false alarms.** Slow transfers looked dead. Explicit failure events replaced the timeout-based guess.
+
+---
+
+## Still open
+
+- `peer-app` sometimes logs "authentication failed" from QUIC — cause not found yet (`docs/problems/`)
+- I haven't measured yet how often relay is needed across different networks, or how much slower it is
+- Nothing here has been tested beyond a handful of peers
+
+---
+
+## Next experiments
+
+Designed, not built — see `docs/future-plans/`:
+
+- **Measure direct vs relay properly:** setup time, speed, success rate, across different network setups
+- **A control dashboard:** scale bots and server pods with buttons, generate traffic, compare direct vs relay live
+- **Swarm-style distribution:** many peers sharing pieces of one file
+- Keeping the same session across reconnects
+- DHT-based peer discovery, a self-hosted Iroh relay, chat over Iroh instead of TCP
+
+---
+
+## Tech I learned through this
+
+| Area | Tools |
+|---|---|
+| P2P / networking | Iroh, QUIC, NAT traversal, relays |
+| Languages | Java (sockets, threads), Rust |
+| Shared state / messaging | Redis (Lua scripts, expiring keys), AWS SNS/SQS |
+| Deployment | Docker, Docker Hub, Kubernetes (k3s), EC2 |
+| Observability | Prometheus, Grafana, structured session logs |
 
 ---
 
@@ -126,10 +154,11 @@ flowchart TB
 
 ```text
 docs/
-├── architecture/     — how the system actually works today
-├── problems/         — real incidents, investigated with real evidence
-├── fixes/            — completed, verified fixes
-├── decisions/        — tradeoffs made, and why
-├── future-plans/     — designed but not yet built
-└── learning-notes/   — the underlying concepts this project draws on
-
+├── architecture/     — how the system works today
+├── problems/         — issues I hit, and what I found
+├── fixes/            — what I changed, and how I checked it worked
+├── decisions/        — tradeoffs and why I chose them
+├── future-plans/     — ideas designed but not built
+├── pending-tasks/    — work in progress
+└── learning-notes/   — concepts I studied along the way
+```
