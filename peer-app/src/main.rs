@@ -4,6 +4,8 @@ use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr,
 };
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{timeout, Duration};
 use tokio_stream::StreamExt;
@@ -15,7 +17,11 @@ const MAX_HEADER_BYTES: usize = 1024;
 const MAX_NAME_CHARS: usize = 100;
 const MAX_ID_CHARS: usize = 64;
 const STALL_TIMEOUT_SECS: u64 = 40;
-const CHUNK_SIZE: usize = 64 * 1024;
+// Phase A4: default read/write chunk. Can be changed for speed tests with
+// PEER_CHUNK_KB (see chunk_size()).
+const DEFAULT_CHUNK_KB: usize = 64;
+// Phase A4: progress lines — at most one per 1% step or per second.
+const PROGRESS_MIN_INTERVAL_MS: u128 = 1000;
 // Phase A3: the hash line after the data is tiny; anything longer is wrong.
 const MAX_TRAILER_BYTES: usize = 100;
 const TRAILER_TIMEOUT_SECS: u64 = 10;
@@ -42,6 +48,12 @@ async fn main() -> Result<()> {
     } else {
         println!("EVENT:ERROR:no relay url available yet");
     }
+    // Phase A4: the direct (IP) addresses this endpoint knows about. Helps
+    // explain why some pairs stay on the relay (e.g. a pod that only knows
+    // its 10.1.x.x address). Java ignores this event.
+    let ips: Vec<String> = my_addr.ip_addrs().map(|a| a.to_string()).collect();
+    println!("EVENT:ENDPOINT_ADDRS:{}", if ips.is_empty() { "none".to_string() } else { ips.join(",") });
+    println!("EVENT:CHUNK_SIZE:{}", chunk_size());
 
     let recv_endpoint = endpoint.clone();
     let recv_username = username.clone();
@@ -71,10 +83,10 @@ async fn main() -> Result<()> {
         if line == "quit" {
             break;
         } else if let Some(rest) = line.strip_prefix("sendto ") {
-            // format: sendto <transfer_id> <endpoint_id> <relay_url> <file_path>
+            // format: sendto <transfer_id> <endpoint_id> <relay_url|-> <file_path>
             let parts: Vec<&str> = rest.splitn(4, ' ').collect();
             if parts.len() != 4 {
-                println!("EVENT:ERROR:usage: sendto <transfer_id> <endpoint_id> <relay_url> <file_path>");
+                println!("EVENT:ERROR:usage: sendto <transfer_id> <endpoint_id> <relay_url|-> <file_path>");
                 continue;
             }
             let transfer_id = parts[0].to_string();
@@ -96,12 +108,20 @@ async fn main() -> Result<()> {
             let parsed_id = endpoint_id_str.parse::<EndpointId>();
             let parsed_relay = relay_url_str.parse::<RelayUrl>();
 
+            // Phase A4 (bug 10): the relay URL is only a hint — discovery finds
+            // the peer by its ID even with a wrong URL (test 10). "-" means
+            // "no hint, dial by ID only".
+            let parsed_relay = if relay_url_str == "-" { Ok(None) } else { parsed_relay.map(Some) };
+
             match (parsed_id, parsed_relay) {
-                (Ok(target_id), Ok(relay_url)) => {
-                    let addr = EndpointAddr::from_parts(
-                        target_id,
-                        std::iter::once(TransportAddr::Relay(relay_url)),
-                    );
+                (Ok(target_id), Ok(relay_hint)) => {
+                    let addr = match relay_hint {
+                        Some(relay_url) => EndpointAddr::from_parts(
+                            target_id,
+                            std::iter::once(TransportAddr::Relay(relay_url)),
+                        ),
+                        None => EndpointAddr::new(target_id),
+                    };
                     let endpoint = endpoint.clone();
                     tokio::spawn(async move {
                         // Phase A1: three distinct outcomes. Only failures the
@@ -176,8 +196,8 @@ fn spawn_path_watcher(conn: &iroh::endpoint::Connection, transfer_id: &str) {
 enum SendOutcome {
     /// Receiver replied OK: file fully received and saved.
     Delivered,
-    /// Receiver replied FAIL. The receiver has already reported the failure
-    /// itself, so the sender must NOT report it again.
+    /// The receiver failed, or will report the failure itself (e.g. after
+    /// we reset the stream), so the sender must NOT report it again.
     ReceiverFailed(String),
 }
 
@@ -208,6 +228,49 @@ fn safe_filename(raw: &str) -> String {
     let trimmed = replaced.trim().trim_start_matches('.').trim_end_matches(['.', ' ']);
     let short: String = trimmed.chars().take(MAX_NAME_CHARS).collect();
     if short.is_empty() { "file".to_string() } else { short }
+}
+
+/// Phase A4: chunk size in bytes. PEER_CHUNK_KB (4..=4096) overrides the
+/// default, read once. Used for speed tests; both sides may differ.
+fn chunk_size() -> usize {
+    static SIZE: OnceLock<usize> = OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let kb = std::env::var("PEER_CHUNK_KB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|kb| (4..=4096).contains(kb))
+            .unwrap_or(DEFAULT_CHUNK_KB);
+        kb * 1024
+    })
+}
+
+/// Phase A4 (bug 11): decides when a progress line is worth printing —
+/// when the percentage changes or a second has passed, and always at 100%.
+/// About 100 lines per transfer instead of one per chunk.
+struct ProgressGate {
+    last_pct: Option<u64>,
+    last_print: Instant,
+}
+
+impl ProgressGate {
+    fn new() -> Self {
+        ProgressGate { last_pct: None, last_print: Instant::now() }
+    }
+
+    fn should_print(&mut self, pct: u64) -> bool {
+        if pct >= 100 && self.last_pct == Some(100) {
+            return false;
+        }
+        let changed = self.last_pct != Some(pct);
+        let slow = self.last_print.elapsed().as_millis() >= PROGRESS_MIN_INTERVAL_MS;
+        if changed || slow {
+            self.last_pct = Some(pct);
+            self.last_print = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 const CONNECT_TIMEOUT_SECS: u64 = 30;
@@ -244,13 +307,17 @@ async fn send_file(endpoint: &Endpoint, target: EndpointAddr, file_path: &PathBu
     let corrupt_for_test = std::env::var("PEER_TEST_CORRUPT_BYTE").as_deref() == Ok("1");
 
     let mut file = tokio::fs::File::open(file_path).await?;
-    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut buf = vec![0u8; chunk_size()];
     let mut sent: u64 = 0;
     // Phase A3: hash while sending, so the file is read only once.
     let mut hasher = blake3::Hasher::new();
+    let mut progress = ProgressGate::new();
 
-    loop {
-        let n = file.read(&mut buf).await?;
+    // Phase A4: send exactly the announced size. If the file grows, the
+    // extra bytes are ignored; if it shrinks, we stop (below).
+    while sent < total_size {
+        let want = (total_size - sent).min(buf.len() as u64) as usize;
+        let n = file.read(&mut buf[..want]).await?;
         if n == 0 {
             break;
         }
@@ -260,8 +327,24 @@ async fn send_file(endpoint: &Endpoint, target: EndpointAddr, file_path: &PathBu
         }
         send.write_all(&buf[..n]).await?;
         sent += n as u64;
-        let pct = if total_size == 0 { 100 } else { (sent * 100 / total_size).min(100) };
-        println!("EVENT:PROGRESS:sending|{filename}|{pct}|{sent}|{total_size}|{transfer_id}");
+        let pct = (sent * 100 / total_size).min(100);
+        if progress.should_print(pct) {
+            println!("EVENT:PROGRESS:sending|{filename}|{pct}|{sent}|{total_size}|{transfer_id}");
+        }
+    }
+    if total_size == 0 {
+        println!("EVENT:PROGRESS:sending|{filename}|100|0|0|{transfer_id}");
+    }
+
+    // Phase A4: the file shrank while we were sending. Abort the stream
+    // instead of sending a hash for a shorter file. The receiver sees the
+    // reset and reports the failure (once); we only note it locally.
+    if sent < total_size {
+        let _ = send.reset(1u32.into());
+        conn.close(1u32.into(), b"file changed");
+        return Ok(SendOutcome::ReceiverFailed(format!(
+            "file changed while sending (sent {sent} of {total_size} bytes)"
+        )));
     }
 
     // Phase A3: the hash goes AFTER the data (it is only known now).
@@ -425,6 +508,7 @@ async fn handle_incoming(incoming: iroh::endpoint::Incoming, _my_username: &str)
 
 /// Phase A2: receive exactly `h.size` bytes into `out_file` and make sure
 /// they are on disk. Phase A3: also check the sender's BLAKE3 hash.
+/// Phase A4: throttled progress + timing breakdown.
 /// Every failure (read, write, stall, disk full, bad hash, extra data)
 /// becomes an Err reason — no `?` that would skip the report.
 /// The bool is true when the connection is already gone (no reply possible).
@@ -435,14 +519,17 @@ async fn receive_body(
     h: &Header,
 ) -> (std::result::Result<(), String>, bool) {
     let total = h.size;
-    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut buf = vec![0u8; chunk_size()];
     let mut received: u64 = 0;
     // Phase A3: hash exactly what we write to disk.
     let mut hasher = blake3::Hasher::new();
+    let mut progress = ProgressGate::new();
+    // Phase A4: where does the time go? data / hash line / sync to disk.
+    let started = Instant::now();
 
     while received < total {
         // Never read past the announced size.
-        let want = (total - received).min(CHUNK_SIZE as u64) as usize;
+        let want = (total - received).min(buf.len() as u64) as usize;
         tokio::select! {
             read_result = recv.read(&mut buf[..want]) => match read_result {
                 Ok(Some(n)) if n > 0 => {
@@ -452,7 +539,9 @@ async fn receive_body(
                     hasher.update(&buf[..n]);
                     received += n as u64;
                     let pct = (received * 100 / total).min(100);
-                    println!("EVENT:PROGRESS:receiving|{}|{pct}|{received}|{total}|{}", h.name, h.transfer_id);
+                    if progress.should_print(pct) {
+                        println!("EVENT:PROGRESS:receiving|{}|{pct}|{received}|{total}|{}", h.name, h.transfer_id);
+                    }
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => return (Err(format!("incomplete ({received}/{total} bytes)")), false),
@@ -466,6 +555,10 @@ async fn receive_body(
             }
         }
     }
+    if total == 0 {
+        println!("EVENT:PROGRESS:receiving|{}|100|0|0|{}", h.name, h.transfer_id);
+    }
+    let data_done = Instant::now();
 
     // Phase A3 (bug 7): right after the data comes the sender's hash line.
     // Anything else (more data, garbage, nothing) is a failure.
@@ -489,6 +582,7 @@ async fn receive_body(
             return (Err("sender sent data after the hash".into()), false);
         }
     }
+    let checked = Instant::now();
 
     // Phase A2 (bug 6): make sure the data is really on disk before the
     // file gets its final name.
@@ -498,6 +592,19 @@ async fn receive_body(
     if let Err(e) = out_file.sync_all().await {
         return (Err(format!("could not sync file to disk: {e}")), false);
     }
+    let synced = Instant::now();
+
+    // Phase A4: timing breakdown (Java ignores this event).
+    let data_ms = (data_done - started).as_millis();
+    let mbps = if data_ms > 0 { total as f64 / 1_048_576.0 / (data_ms as f64 / 1000.0) } else { 0.0 };
+    println!(
+        "EVENT:TRANSFER_TIMING:{}:data_ms={data_ms} hash_wait_ms={} sync_ms={} total_ms={} data_mb_s={mbps:.1} chunk_kb={}",
+        h.transfer_id,
+        (checked - data_done).as_millis(),
+        (synced - checked).as_millis(),
+        (synced - started).as_millis(),
+        chunk_size() / 1024,
+    );
 
     (Ok(()), false)
 }
@@ -569,11 +676,22 @@ mod tests {
         // same result as hashing the whole file at once.
         let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
         let mut h = blake3::Hasher::new();
-        for chunk in data.chunks(CHUNK_SIZE) {
+        for chunk in data.chunks(DEFAULT_CHUNK_KB * 1024) {
             h.update(chunk);
         }
         assert_eq!(h.finalize(), blake3::hash(&data));
         assert_eq!(short("0123456789abcdef"), "0123456789ab");
+    }
+
+    #[test]
+    fn progress_is_throttled() {
+        let mut g = ProgressGate::new();
+        // 10,000 chunks of the same transfer -> at most ~101 lines
+        let printed = (0..=10_000u64).filter(|i| g.should_print(i * 100 / 10_000)).count();
+        assert!(printed <= 101, "printed {printed}");
+        assert!(printed >= 100);
+        // 100% is printed once only
+        assert!(!g.should_print(100));
     }
 
     #[test]
