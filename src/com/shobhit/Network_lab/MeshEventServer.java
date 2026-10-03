@@ -107,13 +107,24 @@ public class MeshEventServer extends WebSocketServer {
         activeTransfers.put(transferId, new TransferInfo(from, to, "pending"));
         broadcastSnapshot();
     }
+    
+ // Phase A1: a transfer is stored as (sender -> receiver), but its result
+    // can now be reported by either side — the receiver reports success and
+    // most failures as (receiver -> sender). Match in both directions.
+    // Before this, only the SENDER's reports ever matched, so receiver-side
+    // failures never reached the mesh.
+    private static boolean samePair(TransferInfo info, String a, String b) {
+        boolean forward = info.from.equals(a) && (b.isEmpty() || info.to.equals(b));
+        boolean reverse = info.to.equals(a) && (b.isEmpty() || info.from.equals(b));
+        return forward || reverse;
+    }
 
     public void applyRemoteComplete(String from, String to, String path) {
         for (Map.Entry<String, TransferInfo> entry : activeTransfers.entrySet()) {
             TransferInfo info = entry.getValue();
-            boolean toMatches = to.isEmpty() || info.to.equals(to);
-            if (info.from.equals(from) && toMatches
-                    && (info.path.equals("pending") || info.path.equals("stalled"))) {
+            if (samePair(info, from, to)
+                    && (info.path.equals("pending") || info.path.equals("stalled")
+                        || info.path.equals("direct") || info.path.equals("relay"))) {
                 info.path = path;
                 info.lastSeenMillis = System.currentTimeMillis();
                 broadcastSnapshot();
@@ -140,8 +151,7 @@ public class MeshEventServer extends WebSocketServer {
     public void applyRemoteFailed(String from, String to, String reason) {
         for (Map.Entry<String, TransferInfo> entry : activeTransfers.entrySet()) {
             TransferInfo info = entry.getValue();
-            boolean toMatches = to.isEmpty() || info.to.equals(to);
-            if (info.from.equals(from) && toMatches && !info.path.equals("failed")) {
+            if (samePair(info, from, to) && !info.path.equals("failed")) {
                 info.path = "failed";
                 System.out.println("[MeshEventServer] Transfer failed (explicit): "
                         + info.from + " -> " + info.to + " (" + reason + ")");
