@@ -42,51 +42,65 @@ Small changes, same overall design. Goal: **correct numbers and safe files** bef
 - `!send all all medium` with 3+ bots → every received file's hash matches the original
 - a sender to an unreachable peer shows a failure on the mesh
 
+**Status:** Phase A ✅ done (evidence: `docs/problems/evidence/`) · Phase B ⏳ planned · Phase C ⏳ later
+
 ---
 
-## Phase B — Move to `iroh-blobs`
+## Phase B: iroh-blobs ("share, then fetch")
+
+Status: **planned** — starts after Phase A is merged.
 
 ### Why
 
-| `iroh-blobs` provides | Replaces / fixes |
+Phase A made the current protocol honest and safe, but some limits stay:
+
+| Limit today (Phase A) | With iroh-blobs |
 |---|---|
-| Files identified by BLAKE3 hash (content addressing) | `META\|name\|size` header |
-| Verified streaming: each chunk checked on arrival | size-only check (7) |
-| Resume and range requests | all-or-nothing transfers (13) |
-| A blob store with safe writes | hand-written `.partial` + rename (5, 6) |
-| Receiver **fetches** from a provider | sender pushes to anyone (9, 12) |
-| Fetching ranges from several providers | groundwork for swarm |
+| Hash checked only at the end | Verified chunk by chunk as data arrives (BLAKE3 tree) |
+| Connection drop = start again from 0% | Resume from the last verified chunk |
+| Sender pushes — anyone can push to you (bug 9) | Receiver fetches — nothing arrives unless asked for |
+| Same file sent twice = sent twice | Content-addressed: one hash, stored once |
+| Only the sender can serve the file | Any peer that has it can serve it (start of swarming) |
+| Our own protocol to maintain | n0's tested library |
 
-Background: [`docs/learning-notes/BLAKE3-hashing.md`](../learning-notes/BLAKE3-hashing.md)
-
-### New flow: share, then fetch
+### New flow
 
 ```mermaid
 sequenceDiagram
-    participant S as Sender peer-app
-    participant SV as Signaling server
-    participant R as Receiver peer-app
-
-    S->>S: add file to blob store → BLAKE3 hash
-    S->>SV: FILE_REQUEST (name, size, hash)
-    SV->>R: FILE_REQUEST
-    R->>SV: FILE_ACCEPT
-    SV->>R: PEER_INFO (sender endpoint)
-    R->>S: fetch blob by hash
-    S-->>R: verified chunks
-    R->>R: export to received_<name> once complete
-    R->>SV: TRANSFER_METRIC (path, bytes, ms) — once
+  participant S as Sender
+  participant Srv as Signaling server
+  participant R as Receiver
+  S->>S: add file to blob store → BLAKE3 hash + ticket
+  S->>Srv: FILE_OFFER (name, size, ticket)
+  Srv->>R: forward offer
+  R->>S: fetch(hash) — receiver pulls
+  Note over R: each chunk verified on arrival
+  R->>R: export to file, report done
 ```
 
 ### Steps
 
-1. **Spike:** find the `iroh-blobs` version that works with `iroh 1.0.x` (the API changed significantly around 0.90 — check before writing code). Run its basic provide/fetch example between two bots.
-2. **New `peer-app` commands:** `share <file>` → prints the hash; `fetch <hash> <endpoint> <transferId> <name>`.
-3. **Protocol change:** `FILE_REQUEST` carries the hash; the receiver starts the fetch after `PEER_INFO`.
-4. **Events:** keep the existing `EVENT:PROGRESS` / `CONNECTION_PATH` / `TRANSFER_PATH` / `TRANSFER_FAILED` lines, emitted from the fetch side, so the mesh keeps working.
-5. **Resume test:** cut the network mid-transfer, fetch again, confirm it continues from the verified chunks.
+| # | Step | Done when |
+|---|---|---|
+| B0 | **Persistent identity + `Router`**: save the endpoint secret key to a file (ID survives restarts); serve our ALPN and blobs through one `Router` | Same endpoint ID after restart; old transfers still work |
+| B1 | **Spike**: small separate program — add file, print ticket, fetch from another process, kill mid-fetch and resume | Resume works; notes on the current iroh-blobs API written down |
+| B2 | **peer-app commands**: `share <id> <path>` → `EVENT:SHARED:<id>:<ticket>`; `fetch <id> <ticket> <name>` → progress / `FILE_RECEIVED` / `TRANSFER_FAILED` | Script drives share + fetch between two peers |
+| B3 | **Java**: offer carries the ticket; receiver starts the fetch on accept | Admin ↔ bot transfer via blobs, hash matches |
+| B4 | **Test script**: resume test (kill connection mid-transfer, fetch continues), plus Phase A checks (1, 3, 5, 7, 8) on the new path | All pass |
+| B5 | **Cleanup**: keep the old protocol for one release, then remove it | Only blobs path left |
 
-**Done when:** transfers run on `iroh-blobs`; a corrupted chunk is rejected; an interrupted transfer resumes instead of restarting.
+### Open questions (answer during B1)
+
+- Store: in-memory or on-disk blob store? (disk needed for resume after restart)
+- Where do fetched files go — keep `received_<id>_<name>` naming?
+- Progress events: what does iroh-blobs expose, and how to throttle them like A4?
+- Who serves the blob after the sender goes offline (later: other peers)?
+
+### After Phase B
+
+- **Mesh v2** (`docs/future-plans/mesh-v2-transfer-events.md`) — designed after B,
+  because B changes the flow to "receiver fetches".
+- **Phase C**: retry with backoff, limits (max size, concurrent transfers), better metrics, gossip experiments.
 
 ---
 
