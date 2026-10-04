@@ -128,6 +128,33 @@ sequenceDiagram
 
 ---
 
+## Phase D: iroh-docs (idea)
+
+Status: **idea** — after Phase B, mesh v2 and Phase C.
+
+**What:** iroh-docs is a shared key-value document that several peers can
+write to and that syncs peer to peer — no central server holds the data.
+It is built on iroh-blobs (content), iroh-gossip (live updates) and
+range-based set reconciliation (catching up efficiently).
+
+```mermaid
+flowchart LR
+  A[Phase A ✅] --> B[Phase B<br/>iroh-blobs] --> M[Mesh v2] --> C[Phase C<br/>retry, limits, gossip] --> D[Phase D<br/>iroh-docs]
+```
+
+**Experiment idea: shared incident log**
+- Several bots write entries (status, notes, photo as a blob).
+- One bot goes offline, others keep writing, it comes back.
+- Check: it catches up automatically, without the signaling server.
+
+**Why:** coordination that keeps working when the central server or the
+internet fails — the core idea behind using P2P for disaster coordination.
+
+**Before starting:** check the current iroh-docs status and API (it has
+changed between versions and is less mature than iroh-blobs).
+
+---
+
 ## Relationship to other documents
 
 - Bugs: `docs/problems/file-transfer-bugs.md`
