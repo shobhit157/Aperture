@@ -96,11 +96,12 @@ sequenceDiagram
 - Progress events: what does iroh-blobs expose, and how to throttle them like A4?
 - Who serves the blob after the sender goes offline (later: other peers)?
 
-### After Phase B
+### Order
 
-- **Mesh v2** (`docs/future-plans/mesh-v2-transfer-events.md`) — designed after B,
-  because B changes the flow to "receiver fetches".
-- **Phase C**: retry with backoff, limits (max size, concurrent transfers), better metrics, gossip experiments.
+- **Before Phase B: Mesh v2** (`docs/future-plans/mesh-v2-transfer-events.md`) —
+  one event type keyed by transfer ID. Events describe states only, so Phase B reuses them.
+- **After Phase B: Phase C** — retry with backoff, limits (max size, concurrent transfers), gossip experiments.
+- Full order: `docs/ROADMAP.md`
 
 ---
 
