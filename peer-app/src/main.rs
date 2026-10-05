@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use iroh::{
-    endpoint::{presets, PathEvent, RecvStream},
+    endpoint::{presets, RecvStream},
     Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr,
 };
 use std::path::PathBuf;
@@ -170,23 +170,41 @@ fn report_path_from_conn(conn: &iroh::endpoint::Connection, transfer_id: &str) {
     println!("EVENT:TRANSFER_PATH:{transfer_id}:{path}");
 }
 
-/// Fix 4: live indicator for the mesh. Prints CONNECTION_PATH every time
-/// Iroh selects a path (first selection, and any later migration). It never
-/// marks anything complete.
+/// Mesh v2 S1: live path indicator for the mesh.
+///
+/// Uses paths_stream(), which yields the CURRENT path list on the first
+/// poll and a new snapshot whenever the selected path changes. The old
+/// path_events() only reported changes AFTER we subscribed — and we
+/// subscribe after connect(), when Iroh has already picked the first path,
+/// so the mesh never learned the starting path (line stayed grey).
+///
+/// Prints CONNECTION_PATH once at the start, then again only when the
+/// selected path actually changes (relay -> direct, direct -> relay).
+/// It never marks anything complete; report_path_from_conn still does that.
 fn spawn_path_watcher(conn: &iroh::endpoint::Connection, transfer_id: &str) {
-    let mut path_events = conn.path_events();
+    let conn = conn.clone();
     let transfer_id = transfer_id.to_string();
     tokio::spawn(async move {
-        while let Some(event) = path_events.next().await {
-            if let PathEvent::Selected { remote_addr, .. } = event {
-                let path = match remote_addr {
-                    TransportAddr::Ip(_) => "direct",
-                    TransportAddr::Relay(_) => "relay",
-                    _ => "custom",
-                };
-                println!("EVENT:CONNECTION_PATH:{transfer_id}:{path}");
+        let mut snapshots = conn.paths_stream();
+        let mut last: Option<&'static str> = None;
+        while let Some(list) = snapshots.next().await {
+            let selected = list.iter().find(|p| p.is_selected()).map(|p| {
+                if p.is_ip() {
+                    "direct"
+                } else if p.is_relay() {
+                    "relay"
+                } else {
+                    "custom"
+                }
+            });
+            if let Some(path) = selected {
+                if last != Some(path) {
+                    println!("EVENT:CONNECTION_PATH:{transfer_id}:{path}");
+                    last = Some(path);
+                }
             }
         }
+        // Stream ends when the connection closes.
     });
 }
 
