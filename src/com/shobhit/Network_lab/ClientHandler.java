@@ -98,12 +98,6 @@ public class ClientHandler implements Runnable {
                 out.println("PEER_INFO|" + message.getContent());
             case REGISTER_ENDPOINT -> {
             }
-            case TRANSFER_METRIC -> {
-            }
-            case TRANSFER_PROGRESS -> {
-            }
-            case CONNECTION_PATH -> {
-            }
             case SESSION_ENDED -> {
                 // Never delivered to any client's screen — this is a
                 // metrics-only signal, not a chat event.
@@ -281,7 +275,7 @@ public class ClientHandler implements Runnable {
                 } catch (Exception e) {
                     System.out.println("[" + username + "] chatRoom.leave failed: " + e.getMessage());
                 }
-                
+
                 // Mesh v2 S3: if this user really left (and doesn't come
                 // back within the grace period), their transfers fail.
                 if (wasOwner && transfers != null) {
@@ -350,13 +344,9 @@ public class ClientHandler implements Runnable {
                             + " heartbeat refresh failed: " + e.getMessage());
                 }
             }
-            case "CONNECTION_PATH" -> {
-                String transferId = parts.length > 1 ? parts[1] : "";
-                String path = parts.length > 2 ? parts[2] : "unknown";
-                String peer = parts.length > 3 ? parts[3] : "";
-                eventBus.publish(new ChatEvent(
-                        new Message(MessageType.CONNECTION_PATH, username, peer, transferId + "|" + path)
-                ));
+            case "CONNECTION_PATH", "TRANSFER_METRIC", "TRANSFER_PROGRESS" -> {
+                // Mesh v1 messages, replaced by TRANSFER_EVENT. An old client
+                // may still send them: ignore, so they never show up as chat.
             }
             case "FILE_REQUEST" -> {
                 String targetUser = parts[1];
@@ -392,22 +382,6 @@ public class ClientHandler implements Runnable {
                 String targetUser = parts[1];
                 eventBus.publish(new ChatEvent(
                         new Message(MessageType.FILE_REJECT, username, targetUser, "")
-                ));
-            }
-            case "TRANSFER_METRIC" -> {
-                String path = parts.length > 1 ? parts[1] : "unknown";
-                String peer = parts.length > 2 ? parts[2] : "";
-                String reason = parts.length > 3 ? parts[3] : "";
-                String content = reason.isEmpty() ? path : path + "|" + reason;
-                eventBus.publish(new ChatEvent(
-                        new Message(MessageType.TRANSFER_METRIC, username, peer, content)
-                ));
-            }
-            case "TRANSFER_PROGRESS" -> {
-                String transferId = parts.length > 1 ? parts[1] : "";
-                String pct = parts.length > 2 ? parts[2] : "0";
-                eventBus.publish(new ChatEvent(
-                        new Message(MessageType.TRANSFER_PROGRESS, username, transferId, pct)
                 ));
             }
             default -> {

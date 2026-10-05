@@ -216,17 +216,6 @@ public class MeshEventServer extends WebSocketServer {
         super.stop();
     }
 
-    // ---------------- old v1 calls (no-ops until S6 cleanup) ----------------
-    // ChatRoom / MessageBroker / MetricsSubscriber still call these. The new
-    // client no longer sends the messages that lead here, and transfer state
-    // now comes from Redis, so they do nothing. Removed in S6.
-
-    public void applyRemoteStart(String from, String to, String transferId) { }
-    public void applyRemoteComplete(String from, String to, String path) { }
-    public void applyRemoteProgress(String transferId, String pct) { }
-    public void applyRemoteFailed(String from, String to, String reason) { }
-    public void applyConnectionPath(String transferId, String path) { }
-
     // ---------------- helpers ----------------
 
     // JSON string with escaping (names and reasons come from users).

@@ -27,7 +27,6 @@ public class Server {
         // Mesh v2 S4: the mesh page reads transfer state from Redis.
         MeshEventServer meshEventServer = new MeshEventServer(5001, transferStore, redisHost, redisPort);
         meshEventServer.start();
-        chatRoom.setMeshEventServer(meshEventServer);
 
         MessageStore messageStore = new MessageStore();
         MessageDispatcher dispatcher = new MessageDispatcher(messageStore, chatRoom);
@@ -47,7 +46,7 @@ public class Server {
         EventBus eventBus = new EventBus();
         eventBus.subscribe(new MessageSubscriber(dispatcher));
         eventBus.subscribe(new ConsoleLoggerSubscriber());
-        eventBus.subscribe(new MetricsSubscriber(metrics, prometheusServer, chatRoom));
+        eventBus.subscribe(new MetricsSubscriber(metrics, prometheusServer));
         eventBus.subscribe(new FileStorageSubscriber());
 
         final PrometheusMetricsServer finalPrometheusServer = prometheusServer;
