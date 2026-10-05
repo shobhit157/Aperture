@@ -33,6 +33,13 @@ public class PrometheusMetricsServer {
             .help("Total file transfers completed via relay")
             .register();
 
+    // Mesh v2 S3: failed transfers (counted once, by the pod whose update
+    // made the transfer "failed").
+    private final Counter fileTransfersFailed = Counter.builder()
+            .name("chat_file_transfers_failed_total")
+            .help("Total file transfers that failed")
+            .register();
+
     private final HTTPServer httpServer;
 
     public PrometheusMetricsServer(int port, RedisClientRegistry registry, ChatRoom chatRoom) throws IOException {
@@ -66,6 +73,8 @@ public class PrometheusMetricsServer {
             fileTransfersRelay.inc();
         }
     }
+
+    public void recordTransferFailed() { fileTransfersFailed.inc(); }
 
     public void stop() { httpServer.close(); }
 }

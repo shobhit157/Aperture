@@ -21,7 +21,11 @@ public class Server {
         RedisClientRegistry registry = new RedisClientRegistry(redisHost, redisPort);
         ChatRoom chatRoom = new ChatRoom(registry, snsTopicArn, instanceId);
 
-        MeshEventServer meshEventServer = new MeshEventServer(5001);
+        // Mesh v2 S3: transfer state lives in Redis, shared by all pods.
+        TransferStore transferStore = new TransferStore(redisHost, redisPort);
+
+        // Mesh v2 S4: the mesh page reads transfer state from Redis.
+        MeshEventServer meshEventServer = new MeshEventServer(5001, transferStore, redisHost, redisPort);
         meshEventServer.start();
         chatRoom.setMeshEventServer(meshEventServer);
 
@@ -35,6 +39,10 @@ public class Server {
         } catch (IOException e) {
             System.err.println("[Prometheus] Failed to start: " + e.getMessage());
         }
+
+        // Mesh v2 S3: events -> Redis, peer left, backup check, metrics.
+        TransferTracker transferTracker = new TransferTracker(transferStore, registry, prometheusServer);
+        transferTracker.startSweeper();
 
         EventBus eventBus = new EventBus();
         eventBus.subscribe(new MessageSubscriber(dispatcher));
@@ -55,6 +63,7 @@ public class Server {
                 Thread.currentThread().interrupt();
             }
             registry.close();
+            transferTracker.stop();
             clientPool.shutdown();
             try {
                 if (!clientPool.awaitTermination(10, TimeUnit.SECONDS)) {
@@ -76,7 +85,7 @@ public class Server {
                 System.out.println("New client: "
                         + clientSocket.getInetAddress()
                         + ":" + clientSocket.getPort());
-                clientPool.submit(new ClientHandler(clientSocket, chatRoom, eventBus));
+                clientPool.submit(new ClientHandler(clientSocket, chatRoom, eventBus, transferTracker));
             }
 
         } catch (IOException e) {

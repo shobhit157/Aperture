@@ -33,6 +33,8 @@ public class ClientHandler implements Runnable {
     private final Socket clientSocket;
     private final ChatRoom chatRoom;
     private final EventBus eventBus;
+    // Mesh v2 S3: transfer state (Redis).
+    private final TransferTracker transfers;
 
     private final String sessionId = UUID.randomUUID().toString().substring(0, 8);
     private final long startedAtMillis = System.currentTimeMillis();
@@ -54,10 +56,12 @@ public class ClientHandler implements Runnable {
     public ClientHandler(
             Socket clientSocket,
             ChatRoom chatRoom,
-            EventBus eventBus) {
+            EventBus eventBus,
+            TransferTracker transfers) {
         this.clientSocket = clientSocket;
         this.chatRoom = chatRoom;
         this.eventBus = eventBus;
+        this.transfers = transfers;
     }
 
     public String getUsername() {
@@ -277,6 +281,12 @@ public class ClientHandler implements Runnable {
                 } catch (Exception e) {
                     System.out.println("[" + username + "] chatRoom.leave failed: " + e.getMessage());
                 }
+                
+                // Mesh v2 S3: if this user really left (and doesn't come
+                // back within the grace period), their transfers fail.
+                if (wasOwner && transfers != null) {
+                    transfers.userLeft(username);
+                }
 
                 try {
                     if (wasOwner) {
@@ -360,9 +370,23 @@ public class ClientHandler implements Runnable {
             case "FILE_ACCEPT" -> {
                 String targetUser = parts[1];
                 String transferId = parts.length > 2 ? parts[2] : "";
+                // Mesh v2 S3: the transfer exists from the moment the
+                // receiver (this user) accepts. targetUser is the sender.
+                // Written BEFORE the sender is told (PEER_INFO), so the
+                // record is there before any path/progress event arrives.
+                if (transfers != null) {
+                    transfers.started(transferId, targetUser, username);
+                }
                 eventBus.publish(new ChatEvent(
                         new Message(MessageType.FILE_ACCEPT, username, targetUser, transferId)
                 ));
+            }
+            case "TRANSFER_EVENT" -> {
+                // Mesh v2 S3: one message type for path / progress / done /
+                // failed, keyed by transfer id. Never treated as chat.
+                if (transfers != null) {
+                    transfers.onClientEvent(username, line);
+                }
             }
             case "FILE_REJECT" -> {
                 String targetUser = parts[1];
