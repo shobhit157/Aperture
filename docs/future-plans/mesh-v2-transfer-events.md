@@ -1,6 +1,6 @@
 # Mesh v2: Transfer Events Redesign
 
-> Plan. Status: **not started** (planned after Phase A is merged).
+> Plan. Status: **next after Phase A** (before Phase B). Events describe states only, so Phase B can reuse them.
 > Today's small fix (live path at transfer start) is done separately — see "Step 0".
 
 ## Why
