@@ -1,400 +1,205 @@
-# Aperture Control Plane
+# Control Plane
 
-## 1. Purpose
+> The Java signaling server: who is online, who wants to talk to whom, and what happened to every transfer.
+> It never carries file bytes.
 
-The Aperture control plane is responsible for **coordination between peers and backend instances**.
-
-It handles signaling, user presence, transfer coordination, and communication between independently running backend instances.
-
-The control plane does **not** carry the actual file data.
-
-> **The control plane decides and coordinates. The data plane transfers.**
+*Last updated: 2026-10-06 (after PR #2). Matches the code on `main`.*
+Back to the [overview](overview.md).
 
 ---
 
-## 2. High-Level Architecture
+## 1. What it does
 
-```text
-                         CONTROL PLANE
+| Job | How |
+|---|---|
+| **Sessions** | One TCP connection per client; heartbeat, timeouts, one owner per username |
+| **Presence** | Who is online, across all pods: Redis with a 75 s TTL |
+| **Signaling** | Routes `FILE_REQUEST` / `FILE_ACCEPT` / `PEER_INFO` between users, even on different pods |
+| **Chat** | Broadcasts chat, join and leave lines to everyone |
+| **Transfer tracking** | Keeps every transfer's state in Redis, counted once ([Mesh v2](../fixes/mesh-v2.md)) |
+| **Observability** | Prometheus metrics on `:9090`, live mesh WebSocket on `:5001` |
 
-                         Java Backend
-                              │
-              ┌───────────────┼───────────────┐
-              │               │               │
-           Presence        Signaling       Messaging
-              │               │               │
-            Redis         Peer Info        SNS/SQS
-                                              │
-                                    ┌─────────┴─────────┐
-                                    ▼                   ▼
-                              Backend A            Backend B
+## 2. Shape
+
+```mermaid
+flowchart TB
+  C1[Client A] -- "TCP :5000 (NodePort 30000)" --> P1
+  C2[Client B] -- "TCP" --> P2
+
+  subgraph P1["signaling-server pod 1"]
+    H1["ClientHandler<br/>(1 thread per connection)"] --> EB1["EventBus"]
+    EB1 --> D1["MessageDispatcher → ChatRoom"]
+    H1 --> T1["TransferTracker"]
+    M1["MeshEventServer :5001"]
+    PR1["Prometheus endpoint :9090"]
+  end
+
+  subgraph P2["signaling-server pod 2"]
+    H2["ClientHandler"] --> EB2["EventBus"] --> D2["MessageDispatcher → ChatRoom"]
+    H2 --> T2["TransferTracker"]
+  end
+
+  R[("Redis<br/>client:&lt;user&gt; · online_users_v2<br/>transfer:&lt;id&gt; · transfers:active<br/>mesh:changed")]
+  SNS["SNS topic → SQS queue per pod<br/>(chat + signaling between pods)"]
+
+  D1 <--> SNS
+  D2 <--> SNS
+  H1 & H2 -- "presence (Lua)" --> R
+  T1 & T2 -- "transfer state (Lua)" --> R
+  R -- "pub/sub" --> M1
 ```
 
-The main components are:
+Inside a pod:
 
-* **Java backend** — application-level coordination
-* **Redis** — shared online-user presence
-* **AWS SNS/SQS** — communication between backend instances
-* **Peer signaling** — exchange of information required to establish the data-plane connection
+- **`ClientHandler`**: one per connection. Handshake, heartbeat, timeouts, ownership checks, parsing client lines.
+- **`EventBus`**: passes each message to its subscribers: the dispatcher (routing), the console logger, metrics, and file storage of chat messages.
+- **`ChatRoom`**: the pod's local users. `sendTo(user)` delivers locally if the user is on this pod; otherwise it publishes to the user's pod through SNS.
+- **`TransferTracker` / `TransferStore`**: transfer events → Redis (atomic Lua), "peer left" handling, the 120 s backup sweep, and counting once.
+- **`MeshEventServer`**: serves the live mesh from Redis.
+- **`RedisClientRegistry`**: presence and ownership scripts.
 
----
+## 3. Session lifecycle
 
-## 3. Java Backend
-
-The Java backend acts as the central coordination point for the application.
-
-Its responsibilities include:
-
-* Managing connected users
-* Tracking online presence
-* Handling signaling messages
-* Coordinating file-transfer requests
-* Routing messages between backend instances
-* Providing the application-level communication layer
-
-The backend does not need to receive, store, or forward the actual file being transferred.
-
-For example:
-
-```text
-Alice ──► Java Backend
-          │
-          │ "Alice wants to send
-          │  a file to Bob"
-          ▼
-        Signaling
-          │
-          ▼
-Bob
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant H as ClientHandler
+  participant R as Redis
+  C->>H: connect (5 s connect timeout)
+  C->>H: username, endpointId, relayUrl (3 lines, 10 s handshake timeout)
+  H->>R: REGISTER (atomic): client:<user>, online set, TTL 75 s
+  H-->>C: >>> user joined (broadcast) + ONLINE|a,b,c
+  loop every 20 s
+    C->>H: PING
+    H-->>C: PONG
+    H->>R: HEARTBEAT (renew only if still owner)
+  end
+  Note over H: every 5 s tick: silent ≥ 60 s → end<br/>every 10 s: still the owner? if not → SUPERSEDED
+  Note over C: no data for 45 s → hang up, reconnect<br/>(backoff 1 → 30 s, reset after 60 s healthy)
+  C--xH: disconnect
+  H->>R: UNREGISTER only if still owner
+  H-->>C: <<< user left (only if owner)
 ```
 
-Once the peers have the information required to communicate, the actual transfer happens through the data plane.
+| Timer | Value | Side |
+|---|---|---|
+| Heartbeat (`PING`) | every 20 s | client |
+| Client read timeout | 45 s | client |
+| Server idle limit | 60 s (checked on a 5 s tick) | server |
+| Ownership check | every 10 s | server |
+| `SUPERSEDED` grace | 5 s | server |
+| Presence TTL | 75 s | Redis |
+| Reconnect backoff | 1, 2, 4, 8, 16, 30 s (no give-up; resets after 60 s healthy) | client |
 
----
+**One owner per username, newest wins.** A new session with the same name takes over:
 
-## 4. User Presence
+- **Same pod:** the old session is told `SUPERSEDED` at once.
+- **Other pod:** the old session's 10 s ownership check notices.
 
-Aperture needs to know which users are currently online.
+The losing client process prints why and **exits with code 3**; it doesn't reconnect ([process ownership](../fixes/chat-reconnect/Process-ownership.md)). A session that didn't own the name when it ended announces **no LEAVE**.
 
-Redis provides shared state for this purpose.
+## 4. Protocol (one text line per message)
 
-A simplified representation is:
+**Client → server**
 
-```text
-Redis
+| Line | Meaning |
+|---|---|
+| *(3 handshake lines)* | username, endpointId, relayUrl |
+| `PING` | heartbeat |
+| `FILE_REQUEST\|<to>\|<filename>\|<size>\|<id>` | sender asks to send a file |
+| `FILE_ACCEPT\|<sender>\|<id>` | receiver accepts; this **creates the transfer record** |
+| `FILE_REJECT\|<sender>` | receiver declines |
+| `TRANSFER_EVENT\|id=..\|state=..\|path=..\|pct=..\|reason=..` | transfer update, see [Mesh v2](../fixes/mesh-v2.md) |
+| anything else | a chat message |
 
-Alice  → online
-Bob    → online
-Bot17  → online
-Bot32  → online
+Old v1 lines (`CONNECTION_PATH`, `TRANSFER_METRIC`, `TRANSFER_PROGRESS`) are **ignored**, so an old client never shows them as chat.
+
+**Server → client**
+
+| Line | Meaning |
+|---|---|
+| `[<user>] <text>` | chat |
+| `>>> <user> joined the chat` / `<<< <user> left the chat` | presence |
+| `ONLINE\|a,b,c` | everyone online (all pods), sent right after join |
+| `FILE_REQUEST\|<from>\|<filename>\|<size>\|<id>` | incoming offer |
+| `FILE_ACCEPT\|<receiver>\|<id>` / `FILE_REJECT\|<receiver>` | answer to an offer |
+| `PEER_INFO\|<receiver>\|<endpointId>\|<relayUrl>\|<id>` | where to connect (sent to the sender after accept) |
+| `PONG` | heartbeat reply |
+| `SUPERSEDED` | another process took your username; stop |
+
+## 5. Signaling across pods
+
+```mermaid
+sequenceDiagram
+  participant A as Alice (pod 1)
+  participant P1 as Pod 1
+  participant R as Redis
+  participant SNS as SNS → SQS
+  participant P2 as Pod 2
+  participant B as Bob (pod 2)
+  A->>P1: FILE_REQUEST|bob|…
+  P1->>R: which pod has bob? (client:bob → instanceId)
+  P1->>SNS: TGT|FILE_REQUEST|alice|bob|… (target = pod 2)
+  SNS->>P2: delivered only to pod 2's queue (filter policy)
+  P2->>B: FILE_REQUEST|alice|…
+  B->>P2: FILE_ACCEPT|alice|id
+  P2->>R: START transfer:id
+  P2->>SNS: TGT|PEER_INFO|… (target = pod 1)
+  SNS->>P1: delivered
+  P1->>A: PEER_INFO|bob|endpointId|relayUrl|id
+  Note over A,B: peers connect directly via Iroh: data plane
 ```
 
-This becomes important when multiple backend instances are running.
-
-Without shared presence information, one backend instance would only know about users connected directly to itself.
-
-Redis provides a common place for backend instances to query this information.
-
----
-
-## 5. Multiple Backend Instances
-
-Aperture is designed to allow more than one backend instance.
-
-For example:
-
-```text
-                    Redis
-                      │
-              shared presence
-                      │
-          ┌───────────┴───────────┐
-          │                       │
-      Backend A               Backend B
-          │                       │
-       Alice                    Bob
-```
-
-Alice may be connected to Backend A while Bob is connected to Backend B.
-
-A transfer request therefore cannot always be handled entirely inside one backend instance.
-
-The system needs a mechanism for communicating between backend instances.
-
----
-
-## 6. Cross-Instance Messaging
-
-AWS SNS/SQS is used to transport control-plane messages between backend instances.
-
-A simplified flow is:
-
-```text
-Alice
-  │
-  ▼
-Backend A
-  │
-  │ control message
-  ▼
-SNS
-  │
-  ▼
-SQS
-  │
-  ▼
-Backend B
-  │
-  ▼
-Bob
-```
-
-This allows backend instances to remain independently deployable while still participating in the same application.
-
-SNS/SQS carries **control messages**, not file contents.
-
----
-
-## 7. Signaling
-
-Signaling is the process of exchanging information required for peers to establish a connection.
-
-In Aperture, the Java backend coordinates this process.
-
-A simplified flow is:
-
-```text
-Alice
-  │
-  │ transfer request
-  ▼
-Java Backend
-  │
-  │ signaling / endpoint information
-  ▼
-Bob
-```
-
-The signaling layer does not establish the actual file-data path itself.
-
-Instead, it helps the peers obtain the information necessary for the data plane to establish communication.
-
-This distinction is important:
-
-```text
-Signaling
-    │
-    ▼
-Helps peers find/connect to each other
-    │
-    ▼
-Data plane
-    │
-    ▼
-Transfers the actual bytes
-```
-
----
-
-## 8. Control Plane vs Data Plane
-
-The two planes have different responsibilities.
-
-| Control Plane          | Data Plane          |
-| ---------------------- | ------------------- |
-| Java                   | Rust + Iroh         |
-| Redis                  | Iroh                |
-| SNS/SQS                | QUIC/P2P transport  |
-| Presence               | Peer connectivity   |
-| Signaling              | NAT traversal       |
-| Transfer coordination  | File transfer       |
-| Cross-server messaging | File/chunk data     |
-| No file payload        | Actual file payload |
-
-The separation prevents the Java backend from becoming the path through which every file must travel.
-
----
-
-## 9. Example: Alice Sends a File to Bob
-
-### Step 1 — Alice connects
-
-```text
-Alice → Backend A
-```
-
-The backend registers Alice as online.
-
-```text
-Redis
-Alice → online
-```
-
-### Step 2 — Bob is online
-
-Bob may be connected to another backend instance.
-
-```text
-Backend B
-   │
-   └── Bob
-```
-
-Redis allows the system to determine that Bob is online.
-
-### Step 3 — Alice requests a transfer
-
-```text
-Alice
-  │
-  │ send file to Bob
-  ▼
-Backend A
-```
-
-### Step 4 — Backend instances coordinate
-
-If Bob belongs to Backend B:
-
-```text
-Backend A
-    │
-    │ control message
-    ▼
- SNS/SQS
-    │
-    ▼
-Backend B
-```
-
-### Step 5 — Signaling information is exchanged
-
-The relevant peer information is passed between the participants.
-
-```text
-Alice ◄──── signaling ────► Bob
-```
-
-### Step 6 — Data-plane connection
-
-The Rust/Iroh components attempt to establish a P2P connection.
-
-```text
-Alice ═══════════════════► Bob
-          Iroh
-```
-
-If direct connectivity fails, Iroh can use a relay.
-
-```text
-Alice ═════► Relay ═════► Bob
-```
-
-### Step 7 — File transfer
-
-The file bytes travel through the data plane.
-
-The Java backend is no longer the file-data path.
-
----
-
-## 10. Why This Separation Matters
-
-A centralized file server would look like:
-
-```text
-Alice ──► Server ──► Bob
-              ▲
-              │
-        file data passes here
-```
-
-With Aperture's architecture:
-
-```text
-             CONTROL PLANE
-Alice ───────► Java ───────► Bob
-                 │
-              signaling
-
-
-              DATA PLANE
-Alice ═════════════════════► Bob
-              Iroh
-```
-
-The backend therefore coordinates the transfer without becoming the transport layer for the file itself.
-
-This is the core architectural distinction between Aperture's control plane and data plane.
-
----
-
-## 11. Failure Boundaries
-
-The separation also creates different failure domains.
-
-### Control-plane failure
-
-Examples:
-
-* Java backend unavailable
-* Redis unavailable
-* SNS/SQS delivery problem
-
-These can prevent peers from coordinating or starting a transfer.
-
-### Data-plane failure
-
-Examples:
-
-* Direct P2P connection cannot be established
-* NAT traversal fails
-* Relay connection fails
-* Peer disconnects during transfer
-
-These affect the actual peer connection or transfer.
-
-Treating these as separate failure domains makes troubleshooting easier.
-
----
-
-## 12. Scaling Direction
-
-The control plane is designed to support multiple backend instances:
-
-```text
-                    Redis
-                      │
-              ┌───────┴───────┐
-              │               │
-          Backend A       Backend B
-              │               │
-            Alice             Bob
-              │               │
-              └──── SNS/SQS ──┘
-```
-
-As the project grows, the control plane can be extended with:
-
-* More backend instances
-* Better routing
-* Persistent transfer state
-* Authentication and authorization
-* Distributed job coordination
-* Swarm metadata
-
-The actual file-transfer workload should remain primarily in the P2P data plane.
-
----
-
-## 13. Architectural Principle
-
-The control plane exists to answer:
-
-> **Who is available, who wants to communicate, and what information is required to establish the connection?**
-
-The data plane answers:
-
-> **How do the peers actually move the data?**
-
-This separation is the foundation for Aperture's transition from simple one-to-one P2P transfers toward a larger distributed file-sharing system.
+- Each pod creates its own SQS queue (`chat-instance-<instanceId>`) subscribed to one SNS topic with a **filter policy**: it receives only `broadcast` messages and messages targeted at itself.
+- Payloads: `BCAST|type|sender|content` for everyone, `TGT|type|sender|target|content` for one pod.
+- Queue retention is 300 s, with a 20 s long poll.
+- Since Mesh v2, **SNS/SQS carries only chat and signaling**. Transfer state goes through Redis.
+
+## 6. Redis data
+
+| Key | Type | Holds | Written by |
+|---|---|---|---|
+| `client:<user>` | hash, TTL 75 s | endpointId, relayUrl, instanceId, sessionId | `REGISTER` / `HEARTBEAT` / `UNREGISTER_IF_OWNER` |
+| `online_users_v2` | sorted set | username → last-seen ms; trimmed to the TTL on read | same scripts |
+| `transfer:<id>` | hash | from, to, state, path, pct, reason, timestamps | `TransferStore` (Lua) |
+| `transfers:active` | sorted set | active transfer IDs by last update | `TransferStore` |
+| `mesh:changed` | pub/sub | "transfer changed" pings | `TransferStore` |
+
+Every multi-step change is **one Lua script**, using **Redis's own clock** (`TIME`), so pods never race and their clocks never matter.
+
+- **`HEARTBEAT` returns:** `1` = renewed, `2` = record was missing and was re-created, `0` = someone else owns the name (touch nothing).
+- **`UNREGISTER_IF_OWNER`** deletes only if the caller still owns the name, so an old session can never erase a new one.
+
+## 7. How it got here
+
+| Stage | Problem | Change | Read more |
+|---|---|---|---|
+| v0 (Aug 31) | — | Java server, Redis presence (plain set), SNS/SQS between pods | [decision 001](../decisions/001-java-signaling.md), [002](../decisions/002-redis-presence.md) |
+| PR #1 (Sep 25) | Presence updates were several separate Redis calls; mesh out of sync | Atomic presence, reconnect logic, k8s manifests | [transfer state vs mesh state](../problems/transfer-state-vs-mesh-state.md) |
+| Reconnect step 1–2 (Sep 27–30) | Cleanup by **username** let an old session erase a new one; null handshake crashed | Session IDs in logs; check-and-delete by session; handshake timeout | [investigation](../problems/chat-reconnect-investigation.md), [redesign](../fixes/chat-reconnect/chat-reconnect-Fixed-design-plan.md) |
+| Step 3 | Client never closed failed sockets, retried 5 times then quit, no connect timeout | Backoff 1 → 30 s with no give-up, reset after 60 s healthy, 5 s connect timeout | [step 3](../fixes/chat-reconnect/reconnect-step3-fix.md) |
+| Step 4 | Silent connections never noticed; Redis presence never expired | PING/PONG, 45 s / 60 s timeouts, ownership check, `SUPERSEDED`, TTL presence (`online_users_v2`) | [redesign](../fixes/chat-reconnect/chat-reconnect-Fixed-design-plan.md), [heartbeat fix](../fixes/chat-heartbeat-fix.md) |
+| Step 5 | Clients' user lists went stale after reconnect | `ONLINE\|…` sent on join | same |
+| Process ownership (Oct 2) | Two windows with one name took it from each other forever | Loser exits with code 3; no reconnect | [process ownership](../fixes/chat-reconnect/Process-ownership.md) |
+| Mesh v2 (Oct 4–6) | Mesh state in each pod's memory, synced over SNS; doubled counts | Transfer state in Redis, `TRANSFER_EVENT`, counted once; `MESH\|…` SNS messages removed | [Mesh v2](../fixes/mesh-v2.md), [decision 006](../decisions/006-transfer-state-in-redis.md) |
+
+## 8. Known limits
+
+| Limit | Effect | Possible fix |
+|---|---|---|
+| **No authentication** | Anyone who can reach port 30000 can join as any username, including taking over `admin` (newest wins) | A shared token or keys per user; later TLS |
+| **Plain TCP, no TLS** | Chat and signaling can be read on the network | TLS, or chat over Iroh/QUIC |
+| **SQS queues pile up** | Every pod start creates `chat-instance-<random>` plus an SNS subscription, and nothing deletes them | Delete the queue on shutdown, or use stable names per pod |
+| **Session = TCP connection** | A short drop means a new session plus LEAVE/JOIN, and chat sent during the gap is lost | [Session resumption (parked)](../future-plans/Chat-reconnect/) |
+| **One thread per connection** | Fine for tens of clients, heavy for thousands | NIO / virtual threads |
+| **AWS dependency for chat** | SNS/SQS adds latency and needs AWS credentials in the cluster | Redis pub/sub for chat too ([mesh evolution](../future-plans/mesh-evolution-plan.md)) |
+
+## 9. Failure boundaries
+
+| Failure | What happens |
+|---|---|
+| A client's network drops | Client notices within 45 s and reconnects with backoff; server ends the session within 60 s; presence expires within 75 s |
+| A server pod dies | Its clients reconnect to the other pod; Redis presence expires by TTL; transfers continue peer-to-peer, and the mesh recovers from Redis |
+| Redis restarts | Heartbeats re-create presence records (`HEARTBEAT` returns 2); active transfer records are lost (the mesh shows them again only if new events arrive) |
+| SNS/SQS unavailable | Cross-pod chat and signaling stop; same-pod users still work; ongoing transfers aren't affected |
+| Same username from two processes | Newest wins; the older process exits with code 3 |
