@@ -1,624 +1,138 @@
-# Aperture Networking Architecture
+# Networking
 
-## 1. Purpose
+> How two peers find each other, how they get through NAT, and what we actually measured.
+> Finding a peer and reaching a peer are different problems.
 
-Aperture is built around peer-to-peer communication across different networks.
-
-The networking layer exists to answer a fundamental question:
-
-> **How can two peers communicate when they may be located behind different private networks, NAT devices, firewalls, or cloud networks?**
-
-The project therefore treats networking as a separate engineering concern from application-level signaling.
+*Last updated: 2026-10-06 (after PR #2).*
+Back to the [overview](overview.md). Related: [data plane](data-plane.md), [deployment](deployment.md).
 
 ---
 
-## 2. Network Model
+## 1. Four separate problems
 
-A typical peer does not necessarily have a publicly reachable IP address.
+| Problem | Question | In Aperture |
+|---|---|---|
+| **Signaling** | Who do I want to talk to, and do they agree? | Java server: `FILE_REQUEST` → `FILE_ACCEPT` → `PEER_INFO` ([control plane](control-plane.md)) |
+| **Discovery** | Endpoint ID → where is it right now? | n0 discovery (`presets::N0`); the server only passes the ID plus a relay hint |
+| **Connectivity** | Can packets get through the NATs? | Iroh: relay first, then hole punching |
+| **Transport** | How do the bytes move reliably? | QUIC streams (Iroh), META3 protocol on top ([data plane](data-plane.md)) |
 
-For example:
+Each can succeed while the next fails. The most common case in our tests: **found** the peer fine, but couldn't **reach** it directly.
 
-```text
-                 Internet
-                    │
-          ┌─────────┴─────────┐
-          │                   │
-        NAT A               NAT B
-          │                   │
-      Private LAN         Private LAN
-          │                   │
-        Alice                 Bob
+## 2. NAT and hole punching in one picture
+
+```mermaid
+sequenceDiagram
+  participant A as Peer A (behind NAT A)
+  participant R as Relay (public)
+  participant B as Peer B (behind NAT B)
+  A->>R: outgoing connection (NAT A allows replies)
+  B->>R: outgoing connection (NAT B allows replies)
+  A->>R: data for B
+  R->>B: data (works at once, but slow, via a server)
+  Note over A,B: through the relay they swap their public ip:port candidates
+  A->>B: UDP to B's public ip:port (opens a hole in NAT A)
+  B->>A: UDP to A's public ip:port (opens a hole in NAT B)
+  Note over A,B: if both holes line up → direct path, traffic moves off the relay
 ```
 
-Alice and Bob may have private addresses such as:
+- A NAT lets **replies** in, not unsolicited traffic. Two peers behind NATs can't simply dial each other.
+- A **relay** always works, because both sides dial *out* to it. But every byte then goes through a server.
+- **Hole punching**: both sides send to each other at the same time, so each NAT sees "a reply" and lets it through.
+- It fails with **symmetric NAT / CGNAT** (the port changes per destination), and when there's **no hairpin NAT** for two peers behind the *same* router (section 4).
 
-```text
-Alice → 192.168.x.x
-Bob   → 10.x.x.x
+Iroh does all of this itself: connect via relay, exchange candidate addresses over that connection, try direct, and switch when direct works. peer-app just watches the result (`paths_stream()` → `EVENT:CONNECTION_PATH`).
+
+## 3. Our test topology
+
+```mermaid
+flowchart TB
+  subgraph Home["Home network (one public IP)"]
+    Router["Home router<br/>(no hairpin NAT)"]
+    subgraph Laptop["Windows laptop"]
+      subgraph WSL["WSL VM · 172.x"]
+        A1["admin"]
+        A2["admin2"]
+      end
+      subgraph DD["Docker Desktop VM"]
+        subgraph K["k8s pod network · 10.1.x"]
+          B["bot pods"]
+        end
+      end
+    end
+    Laptop --- Router
+  end
+  Router --- ISP["ISP"] --- Internet((Internet))
+  Internet --- N0["n0 relays<br/>(e.g. aps1 · Mumbai)"]
+  Internet --- EC2["AWS EC2 (Mumbai)<br/>k3s: signaling server, Redis"]
 ```
 
-Those addresses are meaningful inside their respective networks but are not directly routable across the public Internet.
+Each bot sits behind **several layers of NAT**: pod → Docker Desktop VM → Windows → home router → ISP.
 
-A P2P system therefore needs additional mechanisms for discovery and connectivity.
+## 4. What we measured
 
----
+| Pair | Same machine? | Result | Speed (300 MB) |
+|---|---|---|---|
+| admin ↔ admin2 (both in WSL) | yes, same VM | **relay → direct within ~1 s**; later connections direct at once | ~37 MB/s one way, ~7–11 MB/s the other (unexplained) |
+| `peer` ↔ `peer` test script (WSL) | yes | direct | ~50 MB/s |
+| WSL admin ↔ bot pod | yes, different VMs | **relay only** | ~0.4 MB/s |
+| bot ↔ bot (pods) | same pod network | direct | not measured |
+| laptop ↔ EC2 peer | no | **not tested yet** | — |
 
-## 3. Four Different Networking Problems
+### Why WSL admin ↔ bot stays on the relay
 
-Aperture separates four related but different problems.
-
-```text
-Discovery
-    │
-    ▼
-Connectivity
-    │
-    ▼
-Transport
-    │
-    ▼
-Application Data
+```mermaid
+flowchart LR
+  A["admin (WSL 172.x)"] -- "private: no route<br/>(ping fails both ways)" --x B["bot pod (10.1.x)"]
+  A -- "via public IP:<br/>same IP as the bot" --> Router["router"]
+  Router -- "no hairpin NAT:<br/>won't loop back inside" --x B
+  A == "relay works" ==> Relay["n0 relay"] ==> B
 ```
 
-### Discovery
-
-Find information about a peer.
-
-### Connectivity
-
-Determine whether a usable path can be established.
-
-### Transport
-
-Provide a reliable communication channel once connectivity exists.
-
-### Application Data
-
-Move the actual file or message data.
-
-Confusing these layers makes P2P problems difficult to diagnose.
-
----
-
-## 4. Peer Discovery
-
-Discovery answers:
-
-> **Where can I find information about this peer?**
-
-Aperture can use Iroh's discovery mechanisms to obtain information associated with a peer identity.
-
-Conceptually:
-
-```text
-Alice
-  │
-  │ "Where is Bob?"
-  ▼
-Discovery
-  │
-  ▼
-Bob's endpoint information
-```
-
-Discovery does not guarantee that Alice can establish a direct connection to Bob.
-
-Finding an endpoint and reaching that endpoint are separate problems.
-
----
-
-## 5. Signaling vs Discovery
-
-Aperture also has application-level signaling through the Java backend.
-
-These mechanisms have different responsibilities.
-
-### Java signaling
-
-Coordinates application participants and exchanges information required by the transfer workflow.
-
-### Iroh discovery
-
-Helps locate information associated with a peer.
-
-Conceptually:
-
-```text
-Application signaling
-        │
-        ▼
-Who wants to communicate?
-        │
-        ▼
-Peer information
-        │
-        ▼
-Iroh connectivity
-```
-
-The Java backend is therefore not an Iroh relay and is not the same thing as peer discovery.
-
----
-
-## 6. NAT
-
-Network Address Translation allows multiple private hosts to communicate through a shared public address.
-
-For example:
-
-```text
-Private Network
-
-Alice
-10.0.0.10
-   │
-   ▼
-NAT
-203.x.x.x
-   │
-   ▼
-Internet
-```
-
-The NAT device maintains mappings between internal connections and external connections.
-
-This creates a challenge for inbound P2P communication because another peer may not be able to simply connect to Alice's private address.
-
----
-
-## 7. NAT Traversal
-
-Aperture uses Iroh's connectivity mechanisms to attempt direct peer-to-peer communication across network boundaries.
-
-Conceptually:
-
-```text
-Alice Network                  Bob Network
-
-   Alice                          Bob
-     │                              │
-     ▼                              ▼
-    NAT A                         NAT B
-     │                              │
-     └────────── Internet ──────────┘
-```
-
-The goal is:
-
-```text
-Alice ═══════════════════════► Bob
-             Direct P2P
-```
-
-If the network conditions allow it, the peers communicate directly.
-
----
-
-## 8. Hole Punching
-
-One mechanism used by P2P systems to establish direct connectivity through NAT is hole punching.
-
-A simplified model is:
-
-```text
-Alice                         Bob
-  │                             │
-  │──── outbound traffic ──────►│
-  │                             │
-  │◄──── outbound traffic ──────│
-  │                             │
-  └──────── direct path ────────┘
-```
-
-The exact behavior depends on the NAT implementation and network environment.
-
-Different NAT behaviors can produce very different results.
-
-Therefore, a successful local experiment does not automatically prove that the same approach will work across arbitrary Internet networks.
-
----
-
-## 9. Linux Network Namespace Laboratory
-
-Aperture's networking experiments have used Linux network namespaces to simulate independent hosts.
-
-For example:
-
-```text
-┌─────────────┐             ┌─────────────┐
-│  ns-alice   │             │   ns-bob    │
-│             │             │             │
-│ Java/Rust   │             │ Java/Rust   │
-└──────┬──────┘             └──────┬──────┘
-       │                            │
-       └──────── Linux network ─────┘
-```
-
-Network namespaces provide isolated:
-
-* Network interfaces
-* Routing tables
-* IP addresses
-* Network stacks
-* Firewall configuration
-
-This makes them useful for testing networking behavior without requiring multiple physical machines.
-
----
-
-## 10. Simulating Multiple Networks
-
-The lab can be extended to represent separate networks:
-
-```text
-Network A                       Network B
-
-Alice                           Bob
-  │                               │
-  ▼                               ▼
-br0                             br1
-  │                               │
-  └────────── Router ─────────────┘
-```
-
-For example:
-
-```text
-Network A → 10.0.0.0/24
-Network B → 192.168.1.0/24
-```
-
-A router namespace can connect the networks and provide routing between them.
-
-This allows routing and NAT behavior to be studied independently of the application.
-
----
-
-## 11. Router and NAT
-
-A router namespace can be used to simulate an intermediate network device.
-
-Conceptually:
-
-```text
-Alice
-  │
-  ▼
-Network A
-  │
-  ▼
-Router
-  │
-  ▼
-Network B
-  │
-  ▼
-Bob
-```
-
-Adding NAT changes the problem:
-
-```text
-Alice
-  │
-  ▼
-Private Network
-  │
-  ▼
-NAT Router
-  │
-  ▼
-Public Network
-  │
-  ▼
-Bob
-```
-
-This allows Aperture's P2P behavior to be tested under controlled network conditions.
-
----
-
-## 12. Local vs Internet Experiments
-
-A critical distinction is:
-
-```text
-Local namespace test
-        ≠
-Real Internet NAT test
-```
-
-A Linux namespace environment can reproduce many networking concepts, but it does not automatically reproduce every behavior of residential or enterprise NAT devices.
-
-For this reason, Aperture uses both:
-
-### Controlled local experiments
-
-Useful for:
-
-* Routing
-* IP addressing
-* NAT concepts
-* Packet inspection
-* Application behavior
-* Reproducible testing
-
-### Real network experiments
-
-Useful for:
-
-* Internet NAT behavior
-* Firewall behavior
-* NAT traversal
-* Direct P2P connectivity
-* Relay fallback
-* Real-world latency and throughput
-
----
-
-## 13. Direct vs Relay
-
-The desired connection path is:
-
-```text
-Alice ═════════════════════► Bob
-             Direct
-```
-
-If direct connectivity fails:
-
-```text
-Alice ═════► Iroh Relay ═════► Bob
-```
-
-This gives Aperture a fallback path.
-
-The important observation is:
-
-> A relay solves connectivity, not application signaling.
-
-The Java backend can coordinate the transfer while Iroh independently determines whether the data path is direct or relayed.
-
----
-
-## 14. Connection Path as Experimental Data
-
-A successful file transfer alone does not tell us enough about the network.
-
-For every important experiment, the connection path should be recorded.
-
-For example:
-
-```text
-Transfer
-├── Peer A: Alice
-├── Peer B: Bob
-├── File size: 50 MB
-├── Connection path: Direct P2P
-├── Duration: measured
-├── Throughput: measured
-└── Integrity: verified
-```
-
-Or:
-
-```text
-Transfer
-├── Peer A: India
-├── Peer B: Singapore
-├── Connection path: Relay
-├── Duration: measured
-├── Throughput: measured
-└── Integrity: verified
-```
-
-This prevents us from incorrectly attributing performance differences to the wrong part of the system.
-
----
-
-## 15. Slow Transfer Investigation
-
-Aperture has encountered slow cross-network transfers.
-
-For example, a transfer can succeed while still performing poorly.
-
-That means:
-
-```text
-Connectivity succeeded
-        ≠
-Performance is good
-```
-
-Possible causes include:
-
-* Relay path
-* Network latency
-* Limited relay bandwidth
-* Connection establishment behavior
-* Application-level buffering
-* Chunking strategy
-* Disk I/O
-* CPU overhead
-* TCP/QUIC behavior
-* Network conditions
-
-The correct approach is to measure each stage rather than assume the cause.
-
----
-
-## 16. Same-Host NAT and Hairpin Behavior
-
-Testing multiple network namespaces on the same physical host can produce behavior that differs from two independent Internet hosts.
-
-For example:
-
-```text
-Host
- │
- ├── ns-alice
- │
- └── ns-bob
-```
-
-Traffic between these namespaces may remain within the same host or use local networking paths.
-
-This means a successful same-host test does not necessarily prove that two peers behind independent NAT devices will establish direct connectivity.
-
-NAT hairpinning is another case where behavior depends on the network device and topology.
-
-Therefore, Aperture treats same-host P2P tests as controlled experiments rather than complete representations of Internet P2P behavior.
-
----
-
-## 17. AWS as a Real Network Experiment
-
-Cloud instances provide another environment for testing connectivity.
-
-For example:
-
-```text
-Local Machine
-      │
-      │ Internet
-      ▼
-AWS EC2
-      │
-      ▼
-Rust / Iroh Peer
-```
-
-Multiple cloud regions can later be used to test:
-
-```text
-Mumbai
-   │
-   │ Internet
-   │
-Singapore
-```
-
-and eventually:
-
-```text
-Mumbai ───── Singapore
-   │             │
-   └──── Frankfurt
-```
-
-These experiments can measure how geographical distance, network routing, NAT conditions, and relay placement affect P2P performance.
-
----
-
-## 18. Networking Failure Model
-
-Aperture treats connectivity as something that can fail at multiple stages.
-
-```text
-Discovery
-   │
-   ├── Failure
-   │
-   ▼
-Endpoint information
-   │
-   ├── Failure
-   │
-   ▼
-Direct connectivity
-   │
-   ├── Failure
-   │
-   ▼
-Relay fallback
-   │
-   ├── Failure
-   │
-   ▼
-Transfer
-   │
-   ├── Failure
-   │
-   ▼
-Integrity verification
-```
-
-This gives each failure a different debugging target.
-
-For example:
-
-* Cannot find peer → investigate discovery
-* Peer found but cannot connect → investigate connectivity/NAT
-* Relay connection works but transfer is slow → investigate data path/performance
-* Transfer completes but hash differs → investigate data integrity
-
----
-
-## 19. Networking Principles
-
-### Discovery is not connectivity
-
-Finding a peer does not mean that a connection can be established.
-
-### Connectivity is not transfer
-
-Establishing a connection does not guarantee successful file transfer.
-
-### Local testing is not Internet testing
-
-A controlled namespace topology cannot represent every real-world NAT.
-
-### Direct and relay paths must be measured separately
-
-Their latency and throughput characteristics can be very different.
-
-### Network topology matters
-
-The same application can behave differently depending on:
-
-* NAT type
-* Firewall rules
-* Routing
-* Geographic location
-* Relay location
-* Network congestion
-
-### Experiments should isolate variables
-
-When investigating a failure, avoid changing discovery, topology, NAT conditions, and application behavior simultaneously.
-
-Change one major variable at a time and record the result.
-
----
-
-## 20. Relationship to Aperture
-
-The networking layer connects the control plane and data plane:
-
-```text
-                 APERTURE
-
-          CONTROL PLANE
-               │
-               │ signaling
-               ▼
-          Peer information
-               │
-               ▼
-          NETWORK LAYER
-               │
-       ┌───────┴────────┐
-       │                │
-   Direct P2P         Relay
-       │                │
-       └───────┬────────┘
-               ▼
-           DATA PLANE
-               │
-               ▼
-         File Transfer
-```
-
-The goal is not simply to make two peers exchange bytes.
-
-The networking experiments are intended to understand **why a P2P connection succeeds or fails, which path the data takes, and how that path affects the distributed system as it scales**.
+1. **Private addresses can't reach each other.** The WSL network (`172.x`) and the pod network (`10.1.x`) are separate VMs with no route between them; `ping` fails both ways.
+2. **The public address doesn't help.** Both have the **same public IP**. Sending to your own public IP needs **hairpin NAT** on the router, and ours doesn't do it.
+3. **So only the relay works**, and at ~0.4 MB/s through a public relay it's about 100× slower than direct.
+
+Two peers on the same VM (admin ↔ admin2) have neither problem: they reach each other on local addresses.
+
+## 5. How the understanding evolved
+
+| When | What we thought | What we found | Read more |
+|---|---|---|---|
+| Sep 22 | Same-host Linux namespace tests show P2P works | Same-host tests can't show real NAT behaviour; they often go local or hairpin | [direct connection failure](../problems/direct-connection-failure.md) |
+| Sep 22 | Relay = something broke | Relay is the designed fallback; measure it separately | [relay fallback](../problems/relay-fallback.md) |
+| Sep 24 | Transfers stay on relay because peer-app dials with **only a relay address** | **Not the cause.** Iroh exchanges direct candidates over the relay connection and hole-punches by itself; with the path watcher fixed we saw relay → direct within ~1 s | [direct connection gap](../problems/direct-connection-gap.md) (hypothesis, superseded) |
+| Oct 3 (A4) | The stored relay URL must be right | It's only a hint: discovery finds the peer by ID even with a wrong URL; `-` = no hint | [data plane](data-plane.md) |
+| Oct 4 (S1) | Path unknown until the end | `path_events()` missed the first path; `paths_stream()` gives it immediately | [Mesh v2](../fixes/mesh-v2.md) |
+| Oct 5 | Bots are "slow" | They *find* fine but can't *reach* directly: separate VM networks + no hairpin NAT | [finding vs reaching](../learning-notes/Kademlia-DHT_routing_algorithm/finding-vs-reaching-peers.md) |
+
+## 6. Ports and endpoints
+
+| What | Where | Port | Protocol |
+|---|---|---|---|
+| Chat + signaling | EC2 NodePort | 30000 → 5000 | TCP |
+| Mesh WebSocket | EC2 NodePort | 30001 → 5001 | TCP (WebSocket) |
+| Mesh page | EC2 | 8080 | HTTP |
+| Server metrics | EC2 NodePort | 30090 → 9090 | HTTP |
+| Grafana / Prometheus | EC2 NodePort | 30300 / 30900 | HTTP |
+| peer-app ↔ peer-app | anywhere | random UDP ports | QUIC (ALPN `p2papp/file/0`) |
+| peer-app ↔ n0 relay | n0 servers | 443 | HTTPS / WebSocket |
+
+peer-app needs **no inbound ports** opened anywhere. Everything starts as outgoing traffic, which is the point of relays and hole punching.
+
+## 7. Open experiments
+
+- [ ] **Laptop ↔ EC2 peer:** a real hole punch across two different networks.
+- [ ] **WSL mirrored networking** (`networkingMode=mirrored`): does WSL ↔ bot go direct?
+- [ ] **`hostNetwork: true` for bot pods:** removes one NAT layer.
+- [ ] **Why admin → admin2 is slower than the reverse:** compare with the script speed test.
+- [ ] **Self-hosted relay** in Mumbai on EC2: relay speed under our control ([plan](../future-plans/self-hosted-relay-plan.md)).
+- [ ] **Two regions** (Mumbai ↔ Singapore): distance and relay placement.
+
+## 8. Principles
+
+- **Finding is not reaching.** Discovery can work while connectivity fails.
+- **Same-host tests are not Internet tests.** Record the topology with every result.
+- **Relay is a fallback, not a failure**, but always measure and report it separately.
+- **Change one variable at a time** (path, size, chunk size, machines).
+- **Report the path with every transfer.** It's part of the result, not a detail.
