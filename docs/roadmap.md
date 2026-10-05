@@ -1,257 +1,101 @@
 # Aperture Roadmap
 
-Aperture is being developed incrementally, with each stage building on the previous networking and distributed-systems work.
+> One place for all phases, in order. Details live in the linked docs.
+> Update the status here whenever a step finishes.
 
-The roadmap is intentionally experimental: features are implemented, measured, and refined rather than assumed to work at scale.
+**Legend:** ✅ done · 🔄 in progress · ⏳ next · 💡 idea
 
----
+## Overview
 
-## Phase 1 — Core P2P Foundation
-
-* [x] Java signaling server
-* [x] Peer registration and presence
-* [x] Redis-based shared presence
-* [x] Cross-instance messaging with SNS/SQS
-* [x] Rust peer application
-* [x] Iroh-based peer connectivity
-* [x] Direct P2P connectivity testing
-* [x] Relay fallback testing
-* [x] End-to-end file transfer
-* [x] File integrity verification
-
----
-
-## Phase 2 — Distributed Backend
-
-* [x] Containerized backend instances
-* [x] Shared presence across instances
-* [x] Cross-instance routing
-* [x] Prometheus metrics
-* [x] Grafana monitoring
-* [ ] Kubernetes deployment
-* [ ] Kubernetes service discovery
-* [ ] Health checks and readiness probes
-* [ ] Horizontal scaling tests
-* [ ] Failure and recovery testing
-
----
-
-## Phase 3 — P2P Networking Experiments
-
-* [x] Linux namespace networking
-* [x] NAT traversal experiments
-* [x] Hole-punching experiments
-* [x] Local P2P testing
-* [x] Cross-network P2P testing
-* [x] AWS-based connectivity testing
-* [ ] Measure direct vs relay performance
-* [ ] Test multiple geographic regions
-* [ ] Deploy self-hosted relay
-* [ ] Compare regional relay performance
-* [ ] Improve transfer diagnostics
-
----
-
-## Phase 4 — Reliable File Transfer
-
-* [x] Whole-file integrity verification
-* [x] Transfer progress
-* [ ] Chunked file transfer
-* [ ] Per-chunk integrity verification
-* [ ] Parallel piece transfers
-* [ ] Transfer retry mechanisms
-* [ ] Resumable transfers
-* [ ] Interrupted-transfer recovery
-* [ ] Better throughput measurement
-* [ ] Large-file testing
-
----
-
-## Phase 5 — Distributed File Swarm
-
-The next major architectural step is to move from:
-
-```text
-Alice ─────────► Bob
+```mermaid
+flowchart LR
+  R[Chat reconnect ✅] --> A[Phase A<br/>honest transfers 🔄] --> M[Mesh v2<br/>transfer events ⏳] --> B[Phase B<br/>iroh-blobs 💡] --> C[Phase C<br/>retry, limits, gossip 💡] --> D[Phase D<br/>iroh-docs 💡]
 ```
 
-towards:
-
-```text
-                 ┌──► Bot 1
-                 │
-Admin ─► Swarm ──┼──► Bot 2
-                 │
-                 ├──► Bot 3
-                 │
-                 └──► ...
-```
-
-Planned work:
-
-* [ ] Define distribution jobs
-* [ ] Define participant sets
-* [ ] Create file manifests
-* [ ] Split files into pieces
-* [ ] Generate piece hashes
-* [ ] Track piece availability
-* [ ] Introduce shared swarm metadata
-* [ ] Evaluate Iroh Documents for metadata synchronization
-* [ ] Implement provider discovery
-* [ ] Implement piece scheduling
-* [ ] Implement parallel transfers
-* [ ] Make receivers become providers
-* [ ] Add retry and failure handling
-* [ ] Prevent duplicate piece downloads
-* [ ] Test distributed propagation
-
-### Initial Experiment
-
-A first swarm experiment will use a relatively small number of pieces and bots before increasing the scale.
-
-Example:
-
-```text
-1 GB file
-   │
-   ├── P1
-   ├── P2
-   ├── P3
-   ├── ...
-   └── P10–P15
-```
-
-Initial pieces can be distributed to a subset of bots.
-
-Those bots can then redistribute their pieces to other participants.
-
-The system should measure how the distribution pattern changes as the number of participating peers increases.
+| # | Phase | Goal | Status | Details |
+|---|---|---|---|---|
+| 1 | Chat reconnect | Sessions survive drops; newest login wins; no zombies | ✅ | `docs/Chat-reconnect/` |
+| 2 | **Phase A** | File transfer is correct and honest about failures | 🔄 final checks | `docs/future-plans/file-transfer-improvement-plan.md` |
+| 3 | **Mesh v2** | One event type keyed by transfer ID, state machine, Redis pub/sub | ⏳ | `docs/future-plans/mesh-v2-transfer-events.md` |
+| 4 | **Phase B** | iroh-blobs: verified chunks, resume, receiver fetches | 💡 | `file-transfer-improvement-plan.md` → Phase B |
+| 5 | Phase C | Retry, limits, metrics, gossip experiments | 💡 | `file-transfer-improvement-plan.md` |
+| 6 | Phase D | iroh-docs: shared incident log without a server | 💡 | `file-transfer-improvement-plan.md` |
 
 ---
 
-## Phase 6 — Swarm Scheduling and Optimization
+## 1. Chat reconnect ✅
 
-Once basic swarm distribution works:
+- [x] Steps 1–5: session IDs, PING/PONG, timeouts, supersede (same pod + cross pod), Redis presence with TTL
+- [x] Process ownership: SUPERSEDED → client exits, peer-app stopped
 
-* [ ] Rarest-piece-first scheduling
-* [ ] Provider selection
-* [ ] Provider load awareness
-* [ ] Direct-path preference
-* [ ] Relay fallback
-* [ ] Adaptive parallelism
-* [ ] Bandwidth-aware scheduling
-* [ ] Retry backoff
-* [ ] Piece availability optimization
-* [ ] Transfer prioritization
-* [ ] Swarm performance analysis
+## 2. Phase A: honest file transfer 🔄
 
-The scheduler will remain application logic rather than being delegated entirely to the underlying P2P library.
+Evidence: `docs/problems/evidence/` · Bugs: `docs/problems/file-transfer-bugs.md` · Protocol: `docs/peer-app-protocol.md`
 
----
+- [x] **A1** one result per transfer; receiver replies OK/FAIL; sender errors visible (bugs 1–4)
+- [x] **A2** safe saving: per-transfer files, sync before rename, clean names, header limit (5, 6, 8, 12)
+- [x] **A3** BLAKE3 hash check (7)
+- [x] **A4** progress throttled (11), stop if file changes, timing + addresses; bug 10 not a bug
+- [x] Deployed (server + bots), admin ↔ bot (relay) and admin ↔ admin2 (direct) tested, hashes match
+- [ ] **Step 0** live path on mesh: `paths_stream()`, ID in `TRANSFER_METRIC`, `livePath` — see mesh v2 doc, "Step 0"
+- [ ] Failure test: delete bot mid-transfer → mesh shows failed, not counted
+- [ ] Grafana: +1 per successful transfer
+- [ ] Bot → admin transfer
+- [ ] Docs: bug log, protocol doc, findings, runbook, tools README
+- [ ] Merge `file-transfer-phase-a` → `main`
 
-## Phase 7 — Observability
+## 3. Mesh v2: transfer events ⏳
 
-Expand monitoring across the complete system.
+Details: `docs/future-plans/mesh-v2-transfer-events.md`
 
-### Control Plane
+- [ ] One `TRANSFER_EVENT|id|state|path|pct|reason` message, always with the transfer ID
+- [ ] Per-transfer state machine on the server (`started → moving → done / failed`, stalled as backup)
+- [ ] Redis pub/sub between pods (instead of SNS/SQS for mesh)
+- [ ] Deltas to the browser; finished lines stay ~10 s
+- [ ] Prometheus metrics driven by the same state machine (one source of truth)
+- [ ] Tests: state-machine unit tests, two parallel transfers same pair, two-pod update < 1 s
 
-* [ ] Active users
-* [ ] Active backend instances
-* [ ] Signaling requests
-* [ ] Cross-instance messages
-* [ ] Redis availability
-* [ ] SNS/SQS delivery failures
+**Rule:** events describe **states only** (`started`, `path`, `progress`, `done`,
+`failed`) — never "who pushes". Then Phase B (receiver fetches) reuses the same
+events without redesign.
 
-### Data Plane
+## 4. Phase B: iroh-blobs 💡
 
-* [ ] Active P2P connections
-* [ ] Direct vs relay connections
-* [ ] Connection establishment time
-* [ ] Transfer duration
-* [ ] Throughput
-* [ ] Transfer failures
-* [ ] Retries
-* [ ] Piece availability
-* [ ] Piece transfer rates
+Details: `file-transfer-improvement-plan.md` → Phase B
 
-### Swarm
+- [ ] **B0** persistent identity (key file) + `Router`
+- [ ] **B1** spike: share, fetch, kill and resume (separate small program)
+- [ ] **B2** peer-app `share` / `fetch` commands
+- [ ] **B3** Java: ticket in the offer, receiver fetches — reports via mesh v2 `TRANSFER_EVENT`
+- [ ] **B4** test script: resume test + Phase A checks
+- [ ] **B5** remove the old protocol
 
-* [ ] Number of participating peers
-* [ ] Pieces available per peer
-* [ ] Distribution progress
-* [ ] Replication rate
-* [ ] Missing pieces
-* [ ] Provider utilization
-* [ ] Completion time
+## 5. Phase C 💡
 
----
+- [ ] Retry with backoff (e.g. one retry after connect timeout)
+- [ ] Limits: max file size, max parallel transfers
+- [ ] iroh-gossip experiment: broadcast an alert to all bots without the server
 
-## Phase 8 — Security and Isolation
+## 6. Phase D: iroh-docs 💡
 
-Before treating Aperture as a production-oriented system:
-
-* [ ] Strong application authentication
-* [ ] Authorization for transfers
-* [ ] Distribution-job isolation
-* [ ] Secure peer registration
-* [ ] Validate file and piece metadata
-* [ ] Protect swarm metadata
-* [ ] Prevent unauthorized piece requests
-* [ ] Secure secrets and credentials
-* [ ] Review relay exposure
-* [ ] Security testing
-
-A private transfer must remain isolated from unrelated swarm participants.
+- [ ] Check current iroh-docs status and API
+- [ ] Shared incident log: bots write, one goes offline, catches up on return
 
 ---
 
-## Phase 9 — User-Facing Platform
+## Side tracks (any time)
 
-After the networking and distributed-system foundations are stable:
+| Track | Status | Details |
+|---|---|---|
+| Why bots use the relay (same public IP, no hairpin, separate networks) | ✅ explained | `docs/learning-notes/finding-vs-reaching-peers.md` |
+| Laptop ↔ EC2 peer test (real hole punching) | ⏳ | — |
+| WSL mirrored networking / `hostNetwork` experiment | 💡 | same note |
+| Elastic IP for EC2 (stop IP changing on restart) | 💡 | — |
+| CI/CD (build + test on push) | 💡 | CI/CD plan doc |
+| Dashboard (online users, transfer stats) | 💡 | `Aperture-Dashboard.md` |
 
-* [ ] Production-oriented web interface
-* [ ] Persistent user accounts
-* [ ] File management
-* [ ] Transfer history
-* [ ] Active-transfer status
-* [ ] Distribution-job management
-* [ ] Peer management
-* [ ] Error reporting
-* [ ] User consent and privacy controls
+## How to use this file
 
-The user interface should sit above the existing control and data planes rather than becoming responsible for networking logic.
-
----
-
-# Long-Term Direction
-
-The long-term goal is to evolve Aperture from a P2P file-transfer experiment into a **distributed data-distribution platform**.
-
-The architectural direction is:
-
-```text
-                    APERTURE
-                       │
-          ┌────────────┴────────────┐
-          │                         │
-     Control Plane              Data Plane
-          │                         │
-     Java + Redis             Rust + Iroh
-     SNS / SQS                     │
-          │                         │
-          └──────────┬──────────────┘
-                     │
-              Swarm Scheduler
-                     │
-          ┌──────────┼──────────┐
-          ▼          ▼          ▼
-        Bot A      Bot B      Bot C
-          │          │          │
-          └────── P2P ──────────┘
-```
-
-The fundamental principle remains:
-
-> **The control plane decides what should happen; the data plane moves the data.**
-
-Aperture will use this architecture to investigate how files can be distributed efficiently across geographically separated peers while maintaining reliability, integrity, observability, and controlled participation.
+- Start each session here: pick the first unchecked item.
+- New idea → add it as 💡 in the right phase (or side tracks), with details in its own doc.
+- Finished → tick it, update the status icon, link the evidence.
