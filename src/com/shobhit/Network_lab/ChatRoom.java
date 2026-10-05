@@ -10,7 +10,6 @@ public class ChatRoom {
     private final RedisClientRegistry registry;
     private final MessageBroker broker;
     private final String instanceId;
-    private MeshEventServer meshEventServer;
 
     public ChatRoom(RedisClientRegistry registry, String snsTopicArn, String instanceId) {
         this.registry = registry;
@@ -23,13 +22,6 @@ public class ChatRoom {
         } else {
             this.broker = null;
             System.out.println("[ChatRoom] SNS not configured — single-instance mode (local delivery only).");
-        }
-    }
-
-    public void setMeshEventServer(MeshEventServer meshEventServer) {
-        this.meshEventServer = meshEventServer;
-        if (broker != null) {
-            broker.setMeshEventServer(meshEventServer);
         }
     }
 
@@ -165,45 +157,5 @@ public class ChatRoom {
 
     public int getLocalClientCount() {
         return localClients.size();
-    }
-
-    public void meshTransferStart(String from, String to, String transferId) {
-        if (broker != null) {
-            broker.publishMeshStart(from, to, transferId);
-        } else if (meshEventServer != null) {
-            meshEventServer.applyRemoteStart(from, to, transferId);
-        }
-    }
-
-    public void meshTransferComplete(String from, String to, String path) {
-        if (broker != null) {
-            broker.publishMeshComplete(from, to, path);
-        } else if (meshEventServer != null) {
-            meshEventServer.applyRemoteComplete(from, to, path);
-        }
-    }
-
-    public void meshTransferProgress(String transferId, String pct) {
-        if (broker != null) {
-            broker.publishMeshProgress(transferId, pct);
-        } else if (meshEventServer != null) {
-            meshEventServer.applyRemoteProgress(transferId, pct);
-        }
-    }
-
-    public void meshTransferFailed(String from, String to, String reason) {
-        if (broker != null) {
-            broker.publishMeshFailed(from, to, reason);
-        } else if (meshEventServer != null) {
-            meshEventServer.applyRemoteFailed(from, to, reason);
-        }
-    }
-
-    public void meshConnectionPath(String transferId, String path) {
-        if (broker != null) {
-            broker.publishConnectionPath(transferId, path);
-        } else if (meshEventServer != null) {
-            meshEventServer.applyConnectionPath(transferId, path);
-        }
     }
 }

@@ -13,13 +13,7 @@ public class MessageDispatcher {
     }
 
     public void dispatch(Message message) {
-        // TRANSFER_PROGRESS is high-frequency, purely operational plumbing
-        // that feeds MeshEventServer's internal state — it was never meant
-        // to be part of the chat/audit log. Excluding it here keeps the
-        // server's console clean without affecting mesh accuracy at all.
-        if (message.getType() != MessageType.TRANSFER_PROGRESS) {
-            messageStore.save(message);
-        }
+        messageStore.save(message);
 
         switch (message.getType()) {
             case CHAT, JOIN, LEAVE ->
@@ -39,18 +33,10 @@ public class MessageDispatcher {
                         message.getSender() + "|" + receiverEndpoint + "|" + receiverRelayUrl + "|" + transferId
                 );
                 chatRoom.sendTo(message.getTarget(), peerInfoMsg);
-
-                chatRoom.meshTransferStart(message.getTarget(), message.getSender(), transferId);
             }
 
             case FILE_REJECT ->
                 chatRoom.sendTo(message.getTarget(), message);
-
-            case TRANSFER_PROGRESS -> {
-                String transferId = message.getTarget();
-                String pct = message.getContent();
-                chatRoom.meshTransferProgress(transferId, pct);
-            }
 
             default -> {
             }

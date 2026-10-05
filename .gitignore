@@ -12,3 +12,5 @@ peer-binary/
 bot_large.bin
 bot_medium.bin
 bot_small.txt
+*.log
+peer-bug-check-*/

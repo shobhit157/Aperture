@@ -1,120 +1,306 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-<title>Aperture — Live P2P Mesh</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aperture Mesh</title>
 <style>
-  body { background: #0d0d0d; color: #eee; font-family: sans-serif; padding: 2rem; }
-  #status { font-size: 13px; color: #888; margin-bottom: 1rem; }
-  svg { background: #151515; border-radius: 12px; }
-  .node { fill: #4a9eff; }
-  .node-label { fill: #ccc; font-size: 11px; }
-  .edge-pending { stroke: #888; stroke-width: 2; stroke-dasharray: 2 2; }
-  .edge-direct { stroke: #3ecf8e; stroke-width: 2; }
-  .edge-relay { stroke: #f5a623; stroke-width: 2; stroke-dasharray: 4 3; }
-  #legend { margin-top: 0.75rem; font-size: 12px; color: #999; display: flex; gap: 16px; }
-  #legend span { display: inline-flex; align-items: center; gap: 6px; }
-  #legend .swatch { width: 16px; height: 2px; display: inline-block; }
-  #log { margin-top: 1rem; font-size: 12px; color: #999; max-height: 150px; overflow-y: auto; }
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #2a2f3a; --text: #d7dce5; --muted: #8a93a6;
+    --direct: #3ecf8e; --relay: #f5a623; --pending: #8a93a6; --failed: #ff5c5c; --node: #4ea1ff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 16px; align-items: center;
+           padding: 12px 16px; border-bottom: 1px solid var(--line); }
+  h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  #status { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--line); }
+  #status.ok { background: #1d3b2c; color: var(--direct); }
+  #status.bad { background: #3b1d1d; color: var(--failed); }
+  .stats { display: flex; gap: 14px; font-size: 13px; color: var(--muted); }
+  .stats b { color: var(--text); }
+  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); margin-left: auto; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .legend i { display: inline-block; width: 22px; height: 0; border-top: 2px solid; }
+  main { display: grid; grid-template-columns: 1fr 360px; gap: 0; height: calc(100vh - 53px); }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; height: auto; } #side { max-height: 40vh; } }
+  #graph { width: 100%; height: 100%; min-height: 360px; display: block; }
+  #side { border-left: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
+  #side h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted);
+             margin: 0; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+  #active { padding: 6px 12px; border-bottom: 1px solid var(--line); max-height: 35%; overflow-y: auto; font-size: 12px; }
+  #active .row { display: flex; justify-content: space-between; gap: 8px; padding: 3px 0; }
+  #active .empty { color: var(--muted); padding: 4px 0; }
+  #log { flex: 1; overflow-y: auto; padding: 6px 12px; font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; }
+  #log div { padding: 1px 0; word-break: break-word; }
+  .t { color: var(--muted); }
+  .c-direct { color: var(--direct); } .c-relay { color: var(--relay); }
+  .c-failed { color: var(--failed); } .c-pending { color: var(--pending); }
+  svg text { fill: var(--text); font-size: 12px; }
+  svg .label { fill: var(--muted); font-size: 11px; }
 </style>
 </head>
 <body>
-  <h2>Aperture — Live P2P Mesh</h2>
-  <div id="status">Connecting...</div>
-  <svg id="mesh" width="600" height="400" viewBox="0 0 600 400"></svg>
-  <div id="legend">
-    <span><span class="swatch" style="background:#888; border-bottom:2px dashed #888;"></span>in progress</span>
-    <span><span class="swatch" style="background:#3ecf8e;"></span>direct</span>
-    <span><span class="swatch" style="background:#f5a623; border-bottom:2px dashed #f5a623;"></span>relay</span>
+<header>
+  <h1>Aperture Mesh</h1>
+  <span id="status">connecting...</span>
+  <div class="stats">
+    <span>active <b id="nActive">0</b></span>
+    <span>done <b id="nDone">0</b></span>
+    <span>failed <b id="nFailed">0</b></span>
   </div>
-  <div id="log"></div>
+  <div class="legend">
+    <span><i style="border-color:var(--direct)"></i>direct</span>
+    <span><i style="border-color:var(--relay);border-top-style:dashed"></i>relay</span>
+    <span><i style="border-color:var(--pending);border-top-style:dotted"></i>starting / stalled</span>
+    <span><i style="border-color:var(--failed)"></i>failed</span>
+  </div>
+</header>
+<main>
+  <svg id="graph" viewBox="0 0 1000 700" preserveAspectRatio="xMidYMid meet" aria-label="Transfer mesh"></svg>
+  <aside id="side">
+    <h2>Active transfers</h2>
+    <div id="active"></div>
+    <h2>Log</h2>
+    <div id="log"></div>
+  </aside>
+</main>
 
 <script>
-  const nodes = new Map();
-  const edges = new Map();
-  const svg = document.getElementById('mesh');
-  const statusEl = document.getElementById('status');
-  const logEl = document.getElementById('log');
+/*
+ * Mesh v2 (S5). The server sends:
+ *   {"type":"snapshot","transfers":[T, ...]}   on connect and every 10 s (active transfers)
+ *   {"type":"update","transfer":T}             when one transfer changes (batched, <= 4/s)
+ * T = {id, from, to, state: started|moving|done|failed, path: ""|direct|relay,
+ *      pct, reason, age_ms (time since the transfer's last event)}
+ *
+ * Everything is keyed by transfer id. Each transfer is its own line, so two
+ * transfers between the same users (or opposite directions) are drawn apart.
+ */
+const WS_PORT = new URLSearchParams(location.search).get('ws') || '30001';
+const KEEP_FINISHED_MS = 10000;   // done/failed lines stay this long
+const STALLED_AFTER_MS = 20000;   // no news for this long -> shown as stalled
+const NODE_IDLE_MS = 60000;       // users with no transfer for this long disappear
 
-  function getOrCreateNode(name) {
-    if (!nodes.has(name)) {
-      const angle = nodes.size * 0.9;
-      const r = 140;
-      const cx = 300 + r * Math.cos(angle);
-      const cy = 200 + r * Math.sin(angle);
-      nodes.set(name, { x: cx, y: cy });
-    }
-    return nodes.get(name);
-  }
+const svg = document.getElementById('graph');
+const statusEl = document.getElementById('status');
+const logEl = document.getElementById('log');
+const activeEl = document.getElementById('active');
 
-  function log(msg) {
-    const line = document.createElement('div');
-    line.textContent = new Date().toLocaleTimeString() + ' — ' + msg;
-    logEl.prepend(line);
-  }
+const transfers = new Map();      // id -> {...T, seenAt, finishedAt}
+const nodesLastSeen = new Map();  // user -> ms
+let doneCount = 0, failedCount = 0;
 
-  function edgeClass(path) {
-    if (path === 'direct') return 'edge-direct';
-    if (path === 'relay') return 'edge-relay';
-    return 'edge-pending';
-  }
-
-  function render() {
-    svg.innerHTML = '';
-    for (const [key, edge] of edges) {
-      const a = nodes.get(edge.from);
-      const b = nodes.get(edge.to);
-      if (!a || !b) continue;
-      const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-      line.setAttribute('x1', a.x); line.setAttribute('y1', a.y);
-      line.setAttribute('x2', b.x); line.setAttribute('y2', b.y);
-      line.setAttribute('class', edgeClass(edge.path));
-      svg.appendChild(line);
-    }
-    for (const [name, pos] of nodes) {
-      const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-      circle.setAttribute('cx', pos.x); circle.setAttribute('cy', pos.y);
-      circle.setAttribute('r', 8);
-      circle.setAttribute('class', 'node');
-      svg.appendChild(circle);
-
-      const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-      text.setAttribute('x', pos.x + 12); text.setAttribute('y', pos.y + 4);
-      text.setAttribute('class', 'node-label');
-      text.textContent = name;
-      svg.appendChild(text);
-    }
-  }
-
-  const ws = new WebSocket('ws://' + location.hostname + ':5001');
-
-  ws.onopen = () => { statusEl.textContent = 'Connected'; };
-  ws.onclose = () => { statusEl.textContent = 'Disconnected'; };
-  ws.onerror = () => { statusEl.textContent = 'Connection error'; };
-
-  ws.onmessage = (evt) => {
-    const data = JSON.parse(evt.data);
-    getOrCreateNode(data.from);
-    if (data.to) getOrCreateNode(data.to);
-
-    if (data.type === 'transfer_start') {
-      edges.set(data.from + '->' + data.to, { from: data.from, to: data.to, path: 'pending' });
-      log(data.from + ' -> ' + data.to + ' (starting)');
-    } else if (data.type === 'transfer_complete') {
-      for (const [key, edge] of edges) {
-        if (edge.from === data.from || edge.to === data.from) {
-          edge.path = data.path;
-        }
-      }
-      log(data.from + ' transfer complete (' + data.path + ')');
-      setTimeout(() => {
-        for (const key of edges.keys()) {
-          if (key.includes(data.from)) edges.delete(key);
-        }
-        render();
-      }, 4000);
-    }
-    render();
+// ---------------- WebSocket (auto-reconnect) ----------------
+let ws, retryMs = 1000;
+function connect() {
+  ws = new WebSocket('ws://' + location.hostname + ':' + WS_PORT);
+  ws.onopen = () => { setStatus('connected', 'ok'); retryMs = 1000; };
+  ws.onclose = () => {
+    setStatus('disconnected - retrying', 'bad');
+    setTimeout(connect, retryMs);
+    retryMs = Math.min(retryMs * 2, 15000);
   };
+  ws.onerror = () => {};
+  ws.onmessage = (evt) => {
+    let msg;
+    try { msg = JSON.parse(evt.data); } catch { return; }
+    if (msg.type === 'snapshot') applySnapshot(msg.transfers || []);
+    else if (msg.type === 'update' && msg.transfer) applyUpdate(msg.transfer);
+  };
+}
+function setStatus(text, cls) { statusEl.textContent = text; statusEl.className = cls; }
+
+// ---------------- state ----------------
+function applySnapshot(list) {
+  const ids = new Set(list.map(t => t.id));
+  // An active transfer missing from the snapshot ended and its final update
+  // was missed (rare). Don't guess done/failed - just remove its line.
+  for (const [id, t] of transfers) {
+    if (!ids.has(id) && !isFinal(t.state)) transfers.delete(id);
+  }
+  for (const t of list) applyUpdate(t, true);
+  render();
+}
+
+function applyUpdate(t, fromSnapshot = false) {
+  const now = Date.now();
+  const prev = transfers.get(t.id);
+  if (prev && isFinal(prev.state)) return;            // final stays final
+  const cur = { ...prev, ...t, seenAt: now - (t.age_ms || 0) };
+  if (!prev) cur.firstSeen = now;
+  touchNode(cur.from, now); touchNode(cur.to, now);
+
+  // Log what changed.
+  if (!prev) {
+    log(cur, cur.path ? `started (${cur.path})` : 'started', cur.path || 'pending');
+  } else if (cur.path && cur.path !== prev.path) {
+    log(cur, prev.path ? `path ${prev.path} -> ${cur.path}` : `path ${cur.path}`, cur.path);
+  }
+  if (isFinal(cur.state)) {
+    cur.finishedAt = now;
+    if (cur.state === 'done') { doneCount++; log(cur, `done (${cur.path || '?'})`, cur.path || 'direct'); }
+    else { failedCount++; log(cur, `failed: ${cur.reason || 'unknown'}`, 'failed'); }
+  }
+  transfers.set(cur.id, cur);
+  if (!fromSnapshot) render();
+}
+
+const isFinal = (s) => s === 'done' || s === 'failed';
+function touchNode(name, now) { if (name) nodesLastSeen.set(name, now); }
+
+function isStalled(t, now) {
+  return !isFinal(t.state) && now - t.seenAt > STALLED_AFTER_MS;
+}
+
+// ---------------- drawing ----------------
+const NS = 'http://www.w3.org/2000/svg';
+function el(name, attrs, parent) {
+  const e = document.createElementNS(NS, name);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+
+function colorOf(t, now) {
+  if (t.state === 'failed') return 'failed';
+  if (isStalled(t, now) || !t.path) return 'pending';
+  return t.path === 'relay' ? 'relay' : 'direct';
+}
+
+function render() {
+  const now = Date.now();
+
+  // Drop finished transfers after KEEP_FINISHED_MS, and idle users.
+  for (const [id, t] of transfers) {
+    if (t.finishedAt && now - t.finishedAt > KEEP_FINISHED_MS) transfers.delete(id);
+  }
+  const busy = new Set();
+  for (const t of transfers.values()) { busy.add(t.from); busy.add(t.to); }
+  for (const [name, at] of nodesLastSeen) {
+    if (!busy.has(name) && now - at > NODE_IDLE_MS) nodesLastSeen.delete(name);
+  }
+
+  // Layout: users on a circle, sorted by name (stable positions).
+  const names = [...nodesLastSeen.keys()].sort();
+  const cx = 500, cy = 350, r = names.length > 1 ? Math.min(280, 80 + names.length * 18) : 0;
+  const pos = new Map();
+  names.forEach((n, i) => {
+    const a = (2 * Math.PI * i) / names.length - Math.PI / 2;
+    pos.set(n, { x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) });
+  });
+
+  svg.textContent = '';
+  const defs = el('defs', {}, svg);
+  for (const c of ['direct', 'relay', 'pending', 'failed']) {
+    const m = el('marker', { id: 'arrow-' + c, viewBox: '0 0 10 10', refX: '10', refY: '5',
+      markerWidth: '7', markerHeight: '7', orient: 'auto-start-reverse' }, defs);
+    el('path', { d: 'M0,0 L10,5 L0,10 z', fill: `var(--${c})` }, m);
+  }
+
+  // Several transfers between the same two users: spread them as curves.
+  const groups = new Map();
+  for (const t of transfers.values()) {
+    const key = [t.from, t.to].sort().join('\u0000');
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(t);
+  }
+
+  const edges = el('g', {}, svg);
+  for (const list of groups.values()) {
+    list.sort((a, b) => (a.firstSeen || 0) - (b.firstSeen || 0));
+    list.forEach((t, i) => {
+      const a = pos.get(t.from), b = pos.get(t.to);
+      if (!a || !b) return;
+      const c = colorOf(t, now);
+      // Offset: 0, +1, -1, +2, -2 ... ; direction keeps opposite transfers apart.
+      const k = list.length === 1 ? 0 : (i % 2 ? -1 : 1) * Math.ceil((i + 1) / 2) * 28;
+      const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy) || 1;
+      const nx = -dy / len, ny = dx / len;
+      const sign = t.from < t.to ? 1 : -1;
+      const mx = (a.x + b.x) / 2 + nx * k * sign, my = (a.y + b.y) / 2 + ny * k * sign;
+      // Stop short of the circles so the arrowhead is visible.
+      const sx = a.x + (dx / len) * 22, sy = a.y + (dy / len) * 22;
+      const ex = b.x - (dx / len) * 24, ey = b.y - (dy / len) * 24;
+      const dash = c === 'relay' ? '8 5' : c === 'pending' ? '2 5' : '';
+      const finished = isFinal(t.state);
+      el('path', {
+        d: `M${sx},${sy} Q${mx},${my} ${ex},${ey}`, fill: 'none',
+        stroke: `var(--${c})`, 'stroke-width': finished ? 2 : 2.5,
+        'stroke-dasharray': dash, 'marker-end': `url(#arrow-${c})`,
+        opacity: finished ? 0.55 : 1
+      }, edges);
+      const label = t.state === 'done' ? 'done'
+        : t.state === 'failed' ? 'failed'
+        : isStalled(t, now) ? 'stalled'
+        : t.pct > 0 ? t.pct + '%' : (t.path || 'starting');
+      const lt = el('text', { x: mx, y: my - 6, 'text-anchor': 'middle', class: 'label' }, edges);
+      lt.textContent = label;
+    });
+  }
+
+  const nodes = el('g', {}, svg);
+  for (const n of names) {
+    const p = pos.get(n);
+    el('circle', { cx: p.x, cy: p.y, r: 18, fill: 'var(--panel)', stroke: 'var(--node)', 'stroke-width': 2 }, nodes);
+    const label = el('text', { x: p.x, y: p.y + 34, 'text-anchor': 'middle' }, nodes);
+    label.textContent = shortName(n);
+    const title = el('title', {}, label);
+    title.textContent = n;
+  }
+  if (names.length === 0) {
+    const t = el('text', { x: 500, y: 350, 'text-anchor': 'middle', class: 'label' }, svg);
+    t.textContent = 'No transfers right now';
+  }
+
+  renderSide(now);
+}
+
+function renderSide(now) {
+  const active = [...transfers.values()].filter(t => !isFinal(t.state));
+  document.getElementById('nActive').textContent = active.length;
+  document.getElementById('nDone').textContent = doneCount;
+  document.getElementById('nFailed').textContent = failedCount;
+  activeEl.textContent = '';
+  if (active.length === 0) {
+    const d = document.createElement('div'); d.className = 'empty'; d.textContent = 'none';
+    activeEl.appendChild(d); return;
+  }
+  for (const t of active) {
+    const row = document.createElement('div'); row.className = 'row';
+    const left = document.createElement('span');
+    left.textContent = `${shortName(t.from)} -> ${shortName(t.to)}`;
+    const right = document.createElement('span');
+    const c = colorOf(t, now);
+    right.className = 'c-' + c;
+    right.textContent = (isStalled(t, now) ? 'stalled' : (t.path || 'starting')) + (t.pct > 0 ? ` ${t.pct}%` : '');
+    row.append(left, right); activeEl.appendChild(row);
+  }
+}
+
+// Pod names like dummy-client-5d67c85d89-g728b -> dummy-client-g728b
+function shortName(n) {
+  const m = /^(.*)-[a-z0-9]{8,10}-([a-z0-9]{5})$/.exec(n || '');
+  return m ? m[1] + '-' + m[2] : (n || '?');
+}
+
+function log(t, text, colorClass) {
+  const line = document.createElement('div');
+  const time = new Date().toLocaleTimeString();
+  const ts = document.createElement('span'); ts.className = 't'; ts.textContent = time + ' ';
+  const body = document.createElement('span'); body.className = 'c-' + colorClass;
+  body.textContent = `${shortName(t.from)} -> ${shortName(t.to)}  ${text}`;
+  line.title = `${t.from} -> ${t.to} (${t.id})`;
+  line.append(ts, body);
+  logEl.prepend(line);
+  while (logEl.childNodes.length > 300) logEl.lastChild.remove();
+}
+
+// Redraw regularly so "stalled" and fading finished lines update on their own.
+setInterval(render, 1000);
+render();
+connect();
 </script>
 </body>
 </html>

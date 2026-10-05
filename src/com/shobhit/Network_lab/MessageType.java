@@ -10,8 +10,5 @@ public enum MessageType {
     FILE_ACCEPT,
     FILE_REJECT,
     PEER_INFO,
-    TRANSFER_METRIC,
-    TRANSFER_PROGRESS,
-    CONNECTION_PATH,
     SESSION_ENDED
 }
