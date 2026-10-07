@@ -14,3 +14,8 @@ bot_medium.bin
 bot_small.txt
 *.log
 peer-bug-check-*/
+
+# B0: peer identity (secret keys, never commit)
+.aperture/
+*.key
+*.key.tmp

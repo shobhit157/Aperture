@@ -1,9 +1,10 @@
 use anyhow::{anyhow, Result};
 use iroh::{
-    endpoint::{presets, RecvStream},
-    Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr,
+    endpoint::{presets, Accepting, Connection, RecvStream},
+    protocol::{AcceptError, ProtocolHandler, Router},
+    Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -27,6 +28,11 @@ const MAX_TRAILER_BYTES: usize = 100;
 const TRAILER_TIMEOUT_SECS: u64 = 10;
 // Phase A3: header/trailer version. Both sides must run the same build.
 const HEADER_PREFIX: &str = "META3|";
+// B0: persistent identity.
+const KEY_FILE_NAME: &str = "secret.key";
+const MIN_SEED_CHARS: usize = 32;
+// B0: changing this string changes every derived bot ID. Keep it fixed.
+const KEY_DERIVE_CONTEXT: &str = "aperture peer key v1";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,10 +40,26 @@ async fn main() -> Result<()> {
 
     let username = std::env::args().nth(1).unwrap_or_else(|| "peer".to_string());
 
+    // B0: same key every start -> same endpoint ID. A bad key file or seed
+    // stops peer-app with a clear error instead of quietly using a new ID.
+    let (secret_key, identity) = match load_identity(&username) {
+        Ok(found) => found,
+        Err(e) => {
+            println!("EVENT:ERROR:identity: {}", clean(&e.to_string()));
+            std::process::exit(1);
+        }
+    };
+    println!("EVENT:IDENTITY:{identity}");
+
+    // B0: no .alpns() here — the Router sets them from the protocols it
+    // serves (META3 now, blobs in B2).
     let endpoint = Endpoint::builder(presets::N0)
-        .alpns(vec![ALPN.to_vec()])
+        .secret_key(secret_key)
         .bind()
         .await?;
+    let router = Router::builder(endpoint.clone())
+        .accept(ALPN, Meta3Handler)
+        .spawn();
     endpoint.online().await;
     let my_endpoint_id = endpoint.id();
     println!("EVENT:ENDPOINT_READY:{my_endpoint_id}");
@@ -54,23 +76,6 @@ async fn main() -> Result<()> {
     let ips: Vec<String> = my_addr.ip_addrs().map(|a| a.to_string()).collect();
     println!("EVENT:ENDPOINT_ADDRS:{}", if ips.is_empty() { "none".to_string() } else { ips.join(",") });
     println!("EVENT:CHUNK_SIZE:{}", chunk_size());
-
-    let recv_endpoint = endpoint.clone();
-    let recv_username = username.clone();
-    tokio::spawn(async move {
-        loop {
-            let Some(incoming) = recv_endpoint.accept().await else { break };
-            let recv_username = recv_username.clone();
-            tokio::spawn(async move {
-                if let Err(e) = handle_incoming(incoming, &recv_username).await {
-                    // Phase A2: a connection that failed before any transfer
-                    // started (e.g. QUIC handshake errors). Tagged so it is no
-                    // longer confused with transfer errors.
-                    println!("EVENT:INCOMING_REJECTED:{}", clean(&e.to_string()));
-                }
-            });
-        }
-    });
 
     println!("EVENT:READY_FOR_COMMANDS:");
 
@@ -149,6 +154,132 @@ async fn main() -> Result<()> {
         }
     }
 
+    // B0: stop accepting, let handlers finish their shutdown, close the
+    // endpoint. In B2 this is also where the blob store gets saved.
+    if let Err(e) = router.shutdown().await {
+        println!("EVENT:ERROR:shutdown: {}", clean(&e.to_string()));
+    }
+    Ok(())
+}
+
+/// B0: serves META3 through the Router. The transfer logic itself is
+/// unchanged (handle_incoming).
+#[derive(Debug, Clone)]
+struct Meta3Handler;
+
+impl ProtocolHandler for Meta3Handler {
+    /// Handshake errors keep the old event name (Phase A2), so they are
+    /// still not confused with transfer errors.
+    async fn on_accepting(&self, accepting: Accepting) -> std::result::Result<Connection, AcceptError> {
+        match accepting.await {
+            Ok(conn) => Ok(conn),
+            Err(e) => {
+                println!("EVENT:INCOMING_REJECTED:{}", clean(&e.to_string()));
+                Err(e.into())
+            }
+        }
+    }
+
+    async fn accept(&self, conn: Connection) -> std::result::Result<(), AcceptError> {
+        if let Err(e) = handle_incoming(conn).await {
+            // Phase A2: failed before a transfer started (e.g. no stream).
+            println!("EVENT:INCOMING_REJECTED:{}", clean(&e.to_string()));
+        }
+        Ok(())
+    }
+}
+
+/// B0: where the key comes from, in this order:
+///   1. PEER_KEY_SEED set -> derived from seed + username (bots: same name
+///      and seed give the same ID on any machine, in any region)
+///   2. key file exists   -> loaded
+///   3. otherwise         -> new random key, saved
+/// Returns the key and the text for EVENT:IDENTITY (never the secret).
+fn load_identity(username: &str) -> Result<(SecretKey, String)> {
+    if let Ok(seed) = std::env::var("PEER_KEY_SEED") {
+        if seed.chars().count() < MIN_SEED_CHARS {
+            return Err(anyhow!("PEER_KEY_SEED is shorter than {MIN_SEED_CHARS} characters"));
+        }
+        let bytes = derive_bot_key(&seed, username);
+        return Ok((SecretKey::from_bytes(&bytes), format!("derived:{}", clean(username))));
+    }
+
+    let dir = data_dir(username)?;
+    let path = dir.join(KEY_FILE_NAME);
+    if path.exists() {
+        let bytes = std::fs::read(&path)
+            .map_err(|e| anyhow!("cannot read {}: {e}", path.display()))?;
+        let bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+            anyhow!(
+                "{} has {} bytes, expected 32 (fix or delete it; a new key means a new endpoint ID)",
+                path.display(),
+                bytes.len()
+            )
+        })?;
+        Ok((SecretKey::from_bytes(&bytes), format!("loaded:{}", path.display())))
+    } else {
+        let key = SecretKey::generate();
+        write_key_file(&dir, &path, &key.to_bytes())?;
+        Ok((key, format!("created:{}", path.display())))
+    }
+}
+
+/// B0: same seed + same username -> same 32 bytes, on any machine.
+/// A 0 byte separates them, so ("ab", "c") and ("a", "bc") differ.
+fn derive_bot_key(seed: &str, username: &str) -> [u8; 32] {
+    let mut material = seed.as_bytes().to_vec();
+    material.push(0);
+    material.extend_from_slice(username.as_bytes());
+    blake3::derive_key(KEY_DERIVE_CONTEXT, &material)
+}
+
+/// B0: PEER_DATA_DIR, or ~/.aperture/<username>/ (one folder per username,
+/// so admin and admin2 on one laptop get different IDs). Created if missing.
+fn data_dir(username: &str) -> Result<PathBuf> {
+    let dir = match std::env::var("PEER_DATA_DIR") {
+        Ok(d) if !d.trim().is_empty() => PathBuf::from(d),
+        _ => {
+            let home = std::env::var("HOME")
+                .map_err(|_| anyhow!("HOME is not set; set PEER_DATA_DIR instead"))?;
+            PathBuf::from(home).join(".aperture").join(safe_dir_name(username))
+        }
+    };
+    std::fs::create_dir_all(&dir).map_err(|e| anyhow!("cannot create {}: {e}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(dir)
+}
+
+/// B0: usernames become folder names: keep A-Z a-z 0-9 - _ only.
+fn safe_dir_name(username: &str) -> String {
+    let name: String = username
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .take(MAX_ID_CHARS)
+        .collect();
+    if name.is_empty() { "peer".to_string() } else { name }
+}
+
+/// B0: write the key safely: temp file (owner-only) -> sync -> rename.
+/// A crash never leaves a half-written key behind.
+fn write_key_file(dir: &Path, path: &Path, bytes: &[u8; 32]) -> Result<()> {
+    use std::io::Write;
+    let tmp = dir.join(format!("{KEY_FILE_NAME}.tmp"));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp).map_err(|e| anyhow!("cannot write {}: {e}", tmp.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path).map_err(|e| anyhow!("cannot save {}: {e}", path.display()))?;
     Ok(())
 }
 
@@ -454,8 +585,8 @@ async fn read_header(recv: &mut RecvStream) -> std::result::Result<Header, Strin
     Ok(Header { transfer_id, size, name })
 }
 
-async fn handle_incoming(incoming: iroh::endpoint::Incoming, _my_username: &str) -> Result<()> {
-    let conn = incoming.await?;
+// B0: the Router already finished the handshake and hands us the connection.
+async fn handle_incoming(conn: Connection) -> Result<()> {
     let (mut send, mut recv) = conn.accept_bi().await?;
 
     // Phase A2: a bad header is rejected. We have no valid transfer ID to
@@ -716,5 +847,27 @@ mod tests {
     fn counter_names() {
         assert_eq!(with_counter("received_ab_photo.jpg", 2), "received_ab_photo_2.jpg");
         assert_eq!(with_counter("received_ab_noext", 3), "received_ab_noext_3");
+    }
+
+    #[test]
+    fn derived_keys() {
+        // B0: same seed + same name -> same key (on any machine).
+        let seed = "s".repeat(MIN_SEED_CHARS);
+        assert_eq!(derive_bot_key(&seed, "bot-7"), derive_bot_key(&seed, "bot-7"));
+        // Different name or different seed -> different key.
+        assert_ne!(derive_bot_key(&seed, "bot-7"), derive_bot_key(&seed, "bot-8"));
+        let other = "t".repeat(MIN_SEED_CHARS);
+        assert_ne!(derive_bot_key(&seed, "bot-7"), derive_bot_key(&other, "bot-7"));
+        // The 0 byte keeps seed and name apart.
+        assert_ne!(derive_bot_key("ab", "c"), derive_bot_key("a", "bc"));
+    }
+
+    #[test]
+    fn dir_names() {
+        assert_eq!(safe_dir_name("admin"), "admin");
+        assert_eq!(safe_dir_name("bot-7"), "bot-7");
+        assert_eq!(safe_dir_name("../evil"), "___evil");
+        assert_eq!(safe_dir_name("a b/c"), "a_b_c");
+        assert_eq!(safe_dir_name(""), "peer");
     }
 }
