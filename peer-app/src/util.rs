@@ -25,6 +25,12 @@ pub fn valid_transfer_id(id: &str) -> bool {
         && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// B2: a blob hash is exactly 64 hex characters. Checked before parsing
+/// because iroh-blobs' parser panics (crashes peer-app) on a wrong length.
+pub fn valid_hash_text(hash: &str) -> bool {
+    hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// Phase A2 (bug 8 + path safety): turn any name a peer sends into a plain,
 /// safe filename. Never trust the other side.
 pub fn safe_filename(raw: &str) -> String {
@@ -148,6 +154,16 @@ mod tests {
         assert!(!valid_transfer_id("../x"));
         assert!(!valid_transfer_id("a|b"));
         assert!(!valid_transfer_id(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn hash_text_is_checked() {
+        let good = "a38cf1b054a8ac627eaed9136dd4b6e3ec183cbdcf156eabb5c49a61dff2593d";
+        assert!(valid_hash_text(good));
+        assert!(!valid_hash_text(&format!(":{good}"))); // the copy-paste crash
+        assert!(!valid_hash_text(&good[..63]));
+        assert!(!valid_hash_text(&good.replace('a', "z")));
+        assert!(!valid_hash_text(""));
     }
 
     #[test]

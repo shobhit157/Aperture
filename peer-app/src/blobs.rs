@@ -1,4 +1,4 @@
-//! B2a: file transfer with iroh-blobs ("share, then fetch").
+//! B2: file transfer with iroh-blobs ("share, then fetch").
 //!
 //! Sender:   share <id> <file>  -> hash the file in place, keep it as an offer
 //!           allow <id> <peer>  -> only that peer may fetch it
@@ -6,8 +6,9 @@
 //!                              -> pull the missing chunks, each one verified,
 //!                                 then save as received_<id8>_<name>
 //!
-//! The receiver pulls, the sender only serves. Data lives in a blob store in
-//! the data folder, so chunks that already arrived survive a restart.
+//! B2b-1: offers and fetches are saved (state.rs), so both sides continue
+//! after a restart. A failed fetch keeps its chunks: the same fetch again
+//! resumes instead of starting from 0%.
 
 use anyhow::{anyhow, Result};
 use iroh::{
@@ -31,11 +32,13 @@ use iroh_blobs::{
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_stream::StreamExt;
 
-use crate::util::{clean, percent, safe_filename, save_partial, ProgressGate};
+use crate::state::{modified_ms, now_ms, FetchRecord, OfferRecord, State};
+use crate::util::{clean, percent, safe_filename, save_partial, valid_hash_text, valid_transfer_id, ProgressGate};
 
 /// Unused blob data (no tag) is deleted by the store's garbage collector.
 const GC_INTERVAL_SECS: u64 = 60;
@@ -82,6 +85,21 @@ pub struct FetchRequest {
     pub name: String,
 }
 
+impl FetchRequest {
+    /// B2b-1: rebuild a fetch from fetches.json (checked, never trusted).
+    pub fn from_record(id: &str, rec: &FetchRecord) -> std::result::Result<Self, String> {
+        if !valid_transfer_id(id) {
+            return Err("bad saved transfer id".into());
+        }
+        if !valid_hash_text(&rec.hash) {
+            return Err("bad saved hash".into());
+        }
+        let hash = rec.hash.parse::<Hash>().map_err(|e| format!("bad saved hash: {e}"))?;
+        let sender = rec.sender.parse::<EndpointId>().map_err(|e| format!("bad saved sender: {e}"))?;
+        Ok(FetchRequest { transfer_id: id.to_string(), hash, size: rec.size, sender, name: rec.name.clone() })
+    }
+}
+
 #[derive(Clone)]
 pub struct Blobs {
     store: FsStore,
@@ -90,6 +108,11 @@ pub struct Blobs {
     access: Arc<Mutex<Access>>,
     /// transfer ids being fetched right now (no double fetch of one id)
     fetching: Arc<Mutex<HashSet<String>>>,
+    /// B2b-1: offers.json / fetches.json
+    state: Arc<State>,
+    /// B2b-1: set when peer-app is shutting down, so interrupted fetches
+    /// are reported as paused (they resume on restart), not failed.
+    stopping: Arc<AtomicBool>,
 }
 
 fn tag_out(id: &str) -> String {
@@ -100,10 +123,18 @@ fn tag_in(id: &str) -> String {
     format!("in-{id}")
 }
 
+fn report_state_error(e: anyhow::Error) {
+    println!("EVENT:ERROR:state: {}", clean(&e.to_string()));
+}
+
 impl Blobs {
     /// Opens (or creates) the blob store in `<data_dir>/blobs/` and returns
     /// the protocol handler for the Router.
-    pub async fn open(data_dir: &Path, endpoint: &Endpoint) -> Result<(Self, BlobsProtocol, PathBuf)> {
+    pub async fn open(
+        data_dir: &Path,
+        endpoint: &Endpoint,
+        state: Arc<State>,
+    ) -> Result<(Self, BlobsProtocol, PathBuf)> {
         let root = data_dir.join("blobs");
         std::fs::create_dir_all(&root).map_err(|e| anyhow!("cannot create {}: {e}", root.display()))?;
         let mut options = Options::new(&root);
@@ -139,8 +170,104 @@ impl Blobs {
             downloader,
             access,
             fetching: Arc::new(Mutex::new(HashSet::new())),
+            state,
+            stopping: Arc::new(AtomicBool::new(false)),
         };
         Ok((blobs, protocol, root))
+    }
+
+    /// Called just before shutdown.
+    pub fn begin_shutdown(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+    }
+
+    // ------------------------------------------------------- restart (B2b-1)
+
+    /// Sender side, at startup: bring saved offers back. An offer whose file
+    /// changed or disappeared while peer-app was off is dropped.
+    pub async fn restore_offers(&self) -> usize {
+        let mut restored = 0;
+        for (id, rec) in self.state.offers() {
+            match self.check_offer(&id, &rec).await {
+                Ok(hash) => {
+                    let allowed: HashSet<EndpointId> =
+                        rec.allowed.iter().filter_map(|p| p.parse::<EndpointId>().ok()).collect();
+                    self.access.lock().unwrap().offers.insert(id.clone(), Offer { hash, allowed });
+                    restored += 1;
+                }
+                Err(reason) => {
+                    println!("EVENT:OFFER_DROPPED:{id}:{}", clean(&reason));
+                    if let Err(e) = self.state.remove_offer(&id) {
+                        report_state_error(e);
+                    }
+                    let _ = self.store.tags().delete(tag_out(&id)).await;
+                }
+            }
+        }
+        restored
+    }
+
+    async fn check_offer(&self, id: &str, rec: &OfferRecord) -> std::result::Result<Hash, String> {
+        if !valid_transfer_id(id) {
+            return Err("bad saved transfer id".into());
+        }
+        if !valid_hash_text(&rec.hash) {
+            return Err("bad saved hash".into());
+        }
+        let hash = rec.hash.parse::<Hash>().map_err(|e| format!("bad saved hash: {e}"))?;
+        let meta = std::fs::metadata(&rec.path).map_err(|_| "file is gone".to_string())?;
+        if !meta.is_file() {
+            return Err("not a file any more".into());
+        }
+        if meta.len() != rec.size || modified_ms(&meta) != rec.modified_ms {
+            return Err("file changed while peer-app was off".into());
+        }
+        // Normally the store still has it. If not, hash the file again
+        // (in place) and make sure it is still the same content.
+        let complete = matches!(self.store.blobs().status(hash).await, Ok(BlobStatus::Complete { .. }));
+        if !complete {
+            let haf = self
+                .store
+                .blobs()
+                .add_path_with_opts(AddPathOptions {
+                    path: rec.path.clone(),
+                    format: BlobFormat::Raw,
+                    mode: ImportMode::TryReference,
+                })
+                .with_named_tag(tag_out(id))
+                .await
+                .map_err(|e| format!("could not hash file again: {e}"))?;
+            if haf.hash != hash {
+                return Err("file content changed".into());
+            }
+        }
+        // Make sure the tag that protects it from cleanup exists.
+        self.store
+            .tags()
+            .set(tag_out(id), HashAndFormat::raw(hash))
+            .await
+            .map_err(|e| format!("store error: {e}"))?;
+        Ok(hash)
+    }
+
+    /// Receiver side, at startup: continue every saved, unfinished fetch.
+    pub fn restore_fetches(&self) -> usize {
+        let mut restored = 0;
+        for (id, rec) in self.state.fetches() {
+            match FetchRequest::from_record(&id, &rec) {
+                Ok(req) => {
+                    self.fetch(req);
+                    restored += 1;
+                }
+                Err(reason) => {
+                    println!("EVENT:ERROR:fetch {id}: saved fetch dropped: {}", clean(&reason));
+                    if let Err(e) = self.state.remove_fetch(&id) {
+                        report_state_error(e);
+                    }
+                }
+            }
+        }
+        restored
     }
 
     // ---------------------------------------------------------------- sender
@@ -148,6 +275,11 @@ impl Blobs {
     /// `share <id> <file>`: hash the file in place (no copy) and keep it as
     /// an offer. Prints SHARED when ready.
     pub fn share(&self, transfer_id: String, path: PathBuf) {
+        if self.access.lock().unwrap().offers.contains_key(&transfer_id) {
+            // A mistake in the command, not a failed transfer.
+            println!("EVENT:ERROR:share {transfer_id}: already shared");
+            return;
+        }
         let this = self.clone();
         tokio::spawn(async move {
             match this.do_share(&transfer_id, &path).await {
@@ -161,9 +293,6 @@ impl Blobs {
     }
 
     async fn do_share(&self, transfer_id: &str, path: &Path) -> Result<(Hash, u64, u128)> {
-        if self.access.lock().unwrap().offers.contains_key(transfer_id) {
-            return Err(anyhow!("already shared"));
-        }
         let abs = std::fs::canonicalize(path)
             .map_err(|_| anyhow!("file not found: {}", path.display()))?;
         let meta = std::fs::metadata(&abs)?;
@@ -171,16 +300,15 @@ impl Blobs {
             return Err(anyhow!("not a file: {}", abs.display()));
         }
 
-        // TryReference: hash the file where it is (~1 s for 400 MB in the
-        // B1 spike) instead of copying it into the store. If the file
-        // changes later, verification fails, so a changed file can never
-        // be delivered as correct.
+        // TryReference: hash the file where it is instead of copying it into
+        // the store. If the file changes later, verification fails, so a
+        // changed file can never be delivered as correct.
         let started = Instant::now();
         let haf = self
             .store
             .blobs()
             .add_path_with_opts(AddPathOptions {
-                path: abs,
+                path: abs.clone(),
                 format: BlobFormat::Raw,
                 mode: ImportMode::TryReference,
             })
@@ -189,21 +317,44 @@ impl Blobs {
             .map_err(|e| anyhow!("could not hash file: {e}"))?;
         let ms = started.elapsed().as_millis();
 
-        self.access.lock().unwrap().offers.insert(
-            transfer_id.to_string(),
-            Offer { hash: haf.hash, allowed: HashSet::new() },
-        );
+        {
+            let mut access = self.access.lock().unwrap();
+            if access.offers.contains_key(transfer_id) {
+                return Err(anyhow!("already shared"));
+            }
+            access
+                .offers
+                .insert(transfer_id.to_string(), Offer { hash: haf.hash, allowed: HashSet::new() });
+        }
+
+        // B2b-1: remember it, so it survives a restart.
+        let record = OfferRecord {
+            hash: haf.hash.to_string(),
+            path: abs,
+            size: meta.len(),
+            modified_ms: modified_ms(&meta),
+            allowed: Vec::new(),
+            created_ms: now_ms(),
+        };
+        if let Err(e) = self.state.put_offer(transfer_id, record) {
+            report_state_error(e);
+        }
         Ok((haf.hash, meta.len(), ms))
     }
 
     /// `allow <id> <peer>`: from now on this peer may fetch the offer.
     pub fn allow(&self, transfer_id: &str, peer: EndpointId) -> Result<()> {
-        let mut access = self.access.lock().unwrap();
-        let offer = access
-            .offers
-            .get_mut(transfer_id)
-            .ok_or_else(|| anyhow!("no offer {transfer_id} (share first)"))?;
-        offer.allowed.insert(peer);
+        {
+            let mut access = self.access.lock().unwrap();
+            let offer = access
+                .offers
+                .get_mut(transfer_id)
+                .ok_or_else(|| anyhow!("no offer {transfer_id} (share first)"))?;
+            offer.allowed.insert(peer);
+        }
+        if let Err(e) = self.state.allow(transfer_id, &peer.to_string()) {
+            report_state_error(e);
+        }
         Ok(())
     }
 
@@ -218,6 +369,9 @@ impl Blobs {
                 println!("EVENT:ERROR:unshare: no offer {transfer_id}");
                 return;
             }
+            if let Err(e) = this.state.remove_offer(&transfer_id) {
+                report_state_error(e);
+            }
             if let Err(e) = this.store.tags().delete(tag_out(&transfer_id)).await {
                 println!("EVENT:ERROR:unshare {transfer_id}: {}", clean(&e.to_string()));
                 return;
@@ -230,24 +384,58 @@ impl Blobs {
 
     /// `fetch …`: pull the blob from the sender, then save it as a file.
     /// Ends with FILE_RECEIVED (+ TRANSFER_PATH) or TRANSFER_FAILED, the
-    /// same result events as META3.
+    /// same result events as META3. A failed fetch keeps its chunks.
     pub fn fetch(&self, req: FetchRequest) {
-        {
-            let mut fetching = self.fetching.lock().unwrap();
-            if !fetching.insert(req.transfer_id.clone()) {
-                println!("EVENT:ERROR:fetch {}: already fetching", req.transfer_id);
+        let id = req.transfer_id.clone();
+        let saved = self.state.fetch(&id);
+        if let Some(old) = &saved {
+            if old.hash != req.hash.to_string() {
+                println!("EVENT:ERROR:fetch {id}: this transfer id is already used for a different file");
                 return;
             }
         }
+        {
+            let mut fetching = self.fetching.lock().unwrap();
+            if !fetching.insert(id.clone()) {
+                println!("EVENT:ERROR:fetch {id}: already fetching");
+                return;
+            }
+        }
+
+        // B2b-1: remember it before starting, so a restart continues it.
+        let record = FetchRecord {
+            hash: req.hash.to_string(),
+            size: req.size,
+            sender: req.sender.to_string(),
+            name: req.name.clone(),
+            created_ms: saved.map(|s| s.created_ms).unwrap_or_else(now_ms),
+        };
+        if let Err(e) = self.state.put_fetch(&id, record) {
+            report_state_error(e);
+        }
+
         let this = self.clone();
         tokio::spawn(async move {
             let result = this.do_fetch(&req).await;
-            this.fetching.lock().unwrap().remove(&req.transfer_id);
-            if let Err(reason) = result {
-                // B2a: no retries yet (B2b). Drop the tag so the store can
-                // clean up the partial data.
-                let _ = this.store.tags().delete(tag_in(&req.transfer_id)).await;
-                println!("EVENT:TRANSFER_FAILED:{}:{}", req.transfer_id, clean(&reason));
+            this.fetching.lock().unwrap().remove(&id);
+            match result {
+                Ok(()) => {
+                    if let Err(e) = this.state.remove_fetch(&id) {
+                        report_state_error(e);
+                    }
+                }
+                Err(_) if this.stopping.load(Ordering::SeqCst) => {
+                    // Interrupted by shutdown: kept, resumes on restart.
+                    println!("EVENT:FETCH_PAUSED:{id}:peer-app is stopping, resumes on restart");
+                }
+                Err(reason) => {
+                    // B2b-1: entry and chunks are kept, so the same fetch
+                    // again (or a restart) continues from here.
+                    println!(
+                        "EVENT:TRANSFER_FAILED:{id}:{} (partial data kept; the same fetch again resumes)",
+                        clean(&reason)
+                    );
+                }
             }
         });
     }
@@ -263,24 +451,37 @@ impl Blobs {
             .await
             .map_err(|e| format!("store error: {e}"))?;
 
+        // Already complete in the store? (e.g. stopped after downloading but
+        // before saving the file) Then skip straight to saving.
+        let complete = matches!(
+            self.store.blobs().status(r.hash).await,
+            Ok(BlobStatus::Complete { size }) if size == r.size
+        );
+
         // Chunks already in the store (from an earlier, stopped fetch).
-        let already = self
-            .store
-            .remote()
-            .local(r.hash)
-            .await
-            .map(|info| info.local_bytes())
-            .unwrap_or(0);
+        let already = if complete {
+            r.size
+        } else {
+            self.store
+                .remote()
+                .local(r.hash)
+                .await
+                .map(|info| info.local_bytes())
+                .unwrap_or(0)
+        };
         if already > 0 {
             println!("EVENT:RESUMED:{id}:{already}");
         }
 
-        let path = PathWatch::start(self.endpoint.clone(), r.sender, id.to_string());
         let started = Instant::now();
-        let outcome = self.download(r, &name).await;
+        let mut final_path = None;
+        if !complete {
+            let path = PathWatch::start(self.endpoint.clone(), r.sender, id.to_string());
+            let outcome = self.download(r, &name).await;
+            final_path = path.stop().await;
+            outcome?;
+        }
         let data_done = Instant::now();
-        let final_path = path.stop().await;
-        outcome?;
 
         // Complete and the right size? (every chunk was already verified
         // against the hash while it arrived)
@@ -295,11 +496,10 @@ impl Blobs {
         println!("EVENT:FILE_HASH:{id}:blake3:{}", r.hash);
 
         // Copy out of the store into a per-transfer partial file, then give
-        // it its final name (same naming as META3).
+        // it its final name (same naming as META3). A leftover partial from
+        // an earlier, interrupted run is ours (one fetch per id) -> replace.
         let partial = format!("received_{id}.partial");
-        if tokio::fs::try_exists(&partial).await.unwrap_or(false) {
-            return Err(format!("{partial} already exists"));
-        }
+        let _ = tokio::fs::remove_file(&partial).await;
         let target = std::env::current_dir()
             .map_err(|e| format!("no working folder: {e}"))?
             .join(&partial);
@@ -357,9 +557,11 @@ impl Blobs {
                 }
                 DownloadProgressItem::PartComplete { .. } => complete = true,
                 DownloadProgressItem::ProviderFailed { .. } => {
-                    last_error = Some("sender unreachable or refused the request".into());
+                    last_error = Some(
+                        "could not get data from the sender (offline, unreachable, or this peer is not allowed)".into(),
+                    );
                 }
-                DownloadProgressItem::Error(e) => last_error = Some(e.to_string()),
+                DownloadProgressItem::Error(e) => last_error = Some(format!("download error: {e}")),
                 DownloadProgressItem::DownloadError => {
                     last_error.get_or_insert_with(|| "download failed".into());
                 }
@@ -399,8 +601,8 @@ async fn current_path(endpoint: &Endpoint, peer: EndpointId) -> Option<&'static 
     endpoint.remote_info(peer).await.as_ref().and_then(path_of)
 }
 
-/// Polls relay vs direct during a fetch (B1 spike: visible within ~1 s)
-/// and prints CONNECTION_PATH on every change, like META3 does.
+/// Polls relay vs direct during a fetch and prints CONNECTION_PATH on every
+/// change, like META3 does.
 struct PathWatch {
     task: tokio::task::JoinHandle<()>,
     last: Arc<Mutex<Option<&'static str>>>,
@@ -547,12 +749,9 @@ mod tests {
         let mut a = Access::default();
         a.offers.insert("t1".into(), Offer { hash: h1, allowed: HashSet::from([peer(1)]) });
 
-        // allowed peer, right hash
         assert!(a.knows(&peer(1)));
         assert_eq!(a.offer_for(&peer(1), &h1).as_deref(), Some("t1"));
-        // allowed peer, other hash -> no
         assert_eq!(a.offer_for(&peer(1), &h2), None);
-        // stranger -> no
         assert!(!a.knows(&peer(2)));
         assert_eq!(a.offer_for(&peer(2), &h1), None);
     }
@@ -561,5 +760,27 @@ mod tests {
     fn tags_are_per_transfer() {
         assert_eq!(tag_out("t1"), "out-t1");
         assert_eq!(tag_in("t1"), "in-t1");
+    }
+
+    #[test]
+    fn saved_fetch_is_checked() {
+        let good = FetchRecord {
+            hash: Hash::new(b"x").to_string(),
+            size: 5,
+            sender: peer(1).to_string(),
+            name: "a.bin".into(),
+            created_ms: 0,
+        };
+        assert!(FetchRequest::from_record("t1", &good).is_ok());
+
+        let mut bad_hash = good.clone();
+        bad_hash.hash = format!(":{}", good.hash); // would crash the parser
+        assert!(FetchRequest::from_record("t1", &bad_hash).is_err());
+
+        let mut bad_sender = good.clone();
+        bad_sender.sender = "nope".into();
+        assert!(FetchRequest::from_record("t1", &bad_sender).is_err());
+
+        assert!(FetchRequest::from_record("../x", &good).is_err());
     }
 }

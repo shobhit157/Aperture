@@ -13,3 +13,6 @@ tokio-stream = "0.1"
 anyhow = "1.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 blake3 = "1"
+# B2b: the memory files (offers.json, fetches.json)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
