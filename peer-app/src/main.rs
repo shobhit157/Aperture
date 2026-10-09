@@ -5,6 +5,7 @@
 //!   - META3 (p2papp/file/0): the old push protocol, until B5
 //!   - iroh-blobs: "share, then fetch" (B2)
 //! B2b-1: offers and fetches are saved, so transfers survive restarts.
+//! B2b-2: failed fetches wait for `retry`; `cancel`; 30 min expiry.
 
 mod blobs;
 mod identity;
@@ -82,10 +83,15 @@ async fn main() -> Result<()> {
     let ips: Vec<String> = my_addr.ip_addrs().map(|a| a.to_string()).collect();
     println!("EVENT:ENDPOINT_ADDRS:{}", if ips.is_empty() { "none".to_string() } else { ips.join(",") });
     println!("EVENT:CHUNK_SIZE:{}", chunk_size());
+    // B2b-2: how long shares and fetches live. Java ignores it.
+    println!("EVENT:TRANSFER_TTL:{}", blobs::transfer_ttl_secs());
 
     // B2b-1: unfinished fetches continue once we are online.
     let fetches_restored = blobs.restore_fetches();
     println!("EVENT:RESTORED:{offers_restored}:{fetches_restored}");
+
+    // B2b-2: clean up expired shares and fetches every few seconds.
+    blobs.start_expiry();
 
     println!("EVENT:READY_FOR_COMMANDS:");
 
@@ -140,6 +146,10 @@ fn handle_line(endpoint: &Endpoint, blobs: &Blobs, line: &str) -> bool {
         cmd_unshare(blobs, rest);
     } else if let Some(rest) = line.strip_prefix("fetch ") {
         cmd_fetch(blobs, rest);
+    } else if let Some(rest) = line.strip_prefix("retry ") {
+        cmd_retry(blobs, rest);
+    } else if let Some(rest) = line.strip_prefix("cancel ") {
+        cmd_cancel(blobs, rest);
     } else if !line.is_empty() {
         println!("EVENT:ERROR:unknown command");
     }
@@ -219,6 +229,24 @@ fn cmd_unshare(blobs: &Blobs, rest: &str) {
     let id = rest.trim();
     if check_id(id) {
         blobs.unshare(id.to_string());
+    }
+}
+
+/// retry <transfer_id> | retry all
+fn cmd_retry(blobs: &Blobs, rest: &str) {
+    let target = rest.trim();
+    if target == "all" {
+        blobs.retry_all();
+    } else if check_id(target) {
+        blobs.retry(target);
+    }
+}
+
+/// cancel <transfer_id>
+fn cmd_cancel(blobs: &Blobs, rest: &str) {
+    let id = rest.trim();
+    if check_id(id) {
+        blobs.cancel(id.to_string());
     }
 }
 

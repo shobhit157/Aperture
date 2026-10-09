@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
-# B2b-1 restart tests for peer-app (blobs). Runs two peer-apps ("ta" sender,
-# "tb" receiver) with their own data folders, so your admin keys are untouched.
+# B2b restart / wait tests for peer-app (blobs). Runs two peer-apps ("ta"
+# sender, "tb" receiver) with their own data folders, so your admin keys are
+# untouched.
 #
 #   tools/blobs-test.sh basic             share -> allow -> fetch
 #   tools/blobs-test.sh receiver INT      receiver Ctrl+C at ~30%, restart, resumes
 #   tools/blobs-test.sh receiver KILL     same with kill -9
-#   tools/blobs-test.sh sender            sender Ctrl+C mid-fetch, restart, fetch again
+#   tools/blobs-test.sh sender            sender stops mid-fetch -> WAITING -> back -> retry
 #   tools/blobs-test.sh changed           file changed while sender was off
+#   tools/blobs-test.sh wait              fetch while sender is off -> WAITING -> retry all
+#   tools/blobs-test.sh expire            20 s limit: fetch and share both expire
+#   tools/blobs-test.sh cancel            cancel mid-fetch -> data and record gone
+#   tools/blobs-test.sh all               everything above, in order
 #
 # Settings: PEER=path/to/peer  SIZE_MB=1024  WORK=/tmp/aperture-blobs-test
 set -euo pipefail
@@ -87,6 +92,9 @@ check_file() {
   echo "sha256 match: $a"
 }
 
+# saved <name> <offers|fetches> -> true if transfer $ID is still saved there
+saved() { grep -q "\"$ID\"" "$WORK/data-$1/$2.json" 2>/dev/null; }
+
 setup() {
   [[ -x "$PEER" ]] || fail "peer binary not found: $PEER"
   rm -rf "$WORK/data-ta" "$WORK/data-tb" "$WORK/recv"
@@ -116,6 +124,13 @@ fetch_cmd() { echo "fetch $ID $HASH $SIZE $A_ID test.bin"; }
 AT_30='EVENT:PROGRESS:receiving\|[^|]*\|([3-9][0-9]|100)\|'
 
 case "${1:-basic}" in
+  all)
+    for t in basic "receiver INT" "receiver KILL" sender changed wait expire cancel; do
+      "$0" $t || exit 1
+    done
+    say "ALL PASSED"
+    exit 0 ;;
+
   basic)
     setup; share_and_allow
     send_b "$(fetch_cmd)"
@@ -141,13 +156,15 @@ case "${1:-basic}" in
     wait_for tb "$AT_30" 120
     say "stopping sender with INT"
     stop_peer ta 3 INT
-    wait_for tb "EVENT:TRANSFER_FAILED:$ID:" 120
+    wait_for tb "EVENT:FETCH_WAITING:$ID:" 120
+    grep -m1 "EVENT:FETCH_WAITING:$ID:" "$WORK/tb.log"
     start_peer ta 3 "$WORK/send"
     wait_for ta "EVENT:RESTORED:1:0" 10
-    say "fetch again on the receiver"
-    send_b "$(fetch_cmd)"
+    say "sender is back: retry on the receiver"
+    send_b "retry $ID"
     wait_for tb "EVENT:RESUMED:$ID:" 30
     wait_for tb "EVENT:FILE_RECEIVED:$ID:" 300
+    grep -m1 "EVENT:RESUMED:$ID" "$WORK/tb.log"
     check_file ;;
 
   changed)
@@ -161,8 +178,54 @@ case "${1:-basic}" in
     rm -f "$FILE"                          # next run recreates a clean file
     echo "offer dropped as expected" ;;
 
+  wait)
+    setup; share_and_allow
+    say "sender goes offline before the fetch"
+    stop_peer ta 3 INT
+    send_b "$(fetch_cmd)"
+    wait_for tb "EVENT:FETCH_WAITING:$ID:" 120
+    grep -m1 "EVENT:FETCH_WAITING:$ID:" "$WORK/tb.log"
+    start_peer ta 3 "$WORK/send"
+    wait_for ta "EVENT:RESTORED:1:0" 10
+    say "sender is back: retry all on the receiver"
+    send_b "retry all"
+    wait_for tb "EVENT:RETRY_ALL:1" 10
+    wait_for tb "EVENT:FILE_RECEIVED:$ID:" 300
+    check_file ;;
+
+  expire)
+    export PEER_TRANSFER_TTL_SECS=20
+    setup; share_and_allow
+    wait_for tb "EVENT:TRANSFER_TTL:20" 5
+    stop_peer ta 3 INT
+    send_b "$(fetch_cmd)"
+    wait_for tb "EVENT:FETCH_(WAITING|EXPIRED):$ID" 120
+    say "waiting for the 20 s limit"
+    wait_for tb "EVENT:FETCH_EXPIRED:$ID" 60
+    saved tb fetches && fail "fetch record still saved after expiry"
+    start_peer ta 3 "$WORK/send"
+    wait_for ta "EVENT:RESTORED:0:0" 10
+    wait_for ta "EVENT:OFFER_EXPIRED:$ID" 15
+    saved ta offers && fail "offer record still saved after expiry"
+    echo "fetch and share both expired as expected" ;;
+
+  cancel)
+    setup; share_and_allow
+    send_b "$(fetch_cmd)"
+    wait_for tb "$AT_30" 120
+    say "cancel on the receiver"
+    send_b "cancel $ID"
+    wait_for tb "EVENT:FETCH_CANCELLED:$ID" 10
+    sleep 3
+    grep -q "EVENT:FILE_RECEIVED:$ID:" "$WORK/tb.log" && fail "file arrived after cancel"
+    saved tb fetches && fail "fetch record still saved after cancel"
+    ls "$WORK"/recv/received_${ID}* >/dev/null 2>&1 && fail "received file left behind"
+    send_b "retry $ID"
+    wait_for tb "EVENT:ERROR:retry $ID: no waiting fetch" 10
+    echo "cancelled cleanly" ;;
+
   *)
-    echo "usage: $0 basic | receiver [INT|KILL] | sender | changed"; exit 2 ;;
+    echo "usage: $0 basic | receiver [INT|KILL] | sender | changed | wait | expire | cancel | all"; exit 2 ;;
 esac
 
 send_a quit 2>/dev/null || true

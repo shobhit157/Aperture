@@ -7,8 +7,15 @@
 //!                                 then save as received_<id8>_<name>
 //!
 //! B2b-1: offers and fetches are saved (state.rs), so both sides continue
-//! after a restart. A failed fetch keeps its chunks: the same fetch again
-//! resumes instead of starting from 0%.
+//! after a restart. A failed fetch keeps its chunks.
+//!
+//! B2b-2: a failed fetch first tries again by itself 3 times (5 s, 10 s,
+//! 20 s: short hiccups). If it still fails it WAITS (FETCH_WAITING):
+//!   retry <id> / retry all  -> try again now (Java sends this when the
+//!                              server says the sender is back, B3)
+//!   cancel <id>             -> stop and delete the partial data
+//! Every share and fetch lives PEER_TRANSFER_TTL_SECS (default 30 min) from
+//! when it was created; then it expires and is cleaned up.
 
 use anyhow::{anyhow, Result};
 use iroh::{
@@ -33,8 +40,9 @@ use iroh_blobs::{
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::task::AbortHandle;
 use tokio_stream::StreamExt;
 
 use crate::state::{modified_ms, now_ms, FetchRecord, OfferRecord, State};
@@ -44,6 +52,43 @@ use crate::util::{clean, percent, safe_filename, save_partial, valid_hash_text, 
 const GC_INTERVAL_SECS: u64 = 60;
 /// How often the receiver checks relay vs direct while fetching.
 const PATH_POLL_MS: u64 = 500;
+/// B2b-2: how long a share or fetch lives, unless PEER_TRANSFER_TTL_SECS says otherwise.
+const DEFAULT_TTL_SECS: u64 = 30 * 60;
+/// B2b-2: how often expired shares and fetches are cleaned up.
+const EXPIRY_CHECK_SECS: u64 = 5;
+/// B2b-2: after a failed try, wait this long and try again by itself
+/// (short hiccups: just started, network blip). Then FETCH_WAITING.
+const QUICK_RETRY_SECS: [u64; 3] = [5, 10, 20];
+
+// ---------------------------------------------------------- expiry (B2b-2)
+
+/// Transfer lifetime in seconds (read once from PEER_TRANSFER_TTL_SECS).
+pub fn transfer_ttl_secs() -> u64 {
+    static TTL: OnceLock<u64> = OnceLock::new();
+    *TTL.get_or_init(|| {
+        std::env::var("PEER_TRANSFER_TTL_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(DEFAULT_TTL_SECS)
+    })
+}
+
+fn ttl_ms() -> u64 {
+    transfer_ttl_secs().saturating_mul(1000)
+}
+
+fn is_expired(created_ms: u64, now: u64, ttl: u64) -> bool {
+    now >= created_ms.saturating_add(ttl)
+}
+
+fn secs_left(created_ms: u64, now: u64, ttl: u64) -> u64 {
+    created_ms.saturating_add(ttl).saturating_sub(now) / 1000
+}
+
+fn expired_now(created_ms: u64) -> bool {
+    is_expired(created_ms, now_ms(), ttl_ms())
+}
 
 /// One file the sender is offering.
 #[derive(Debug, Clone)]
@@ -106,8 +151,9 @@ pub struct Blobs {
     endpoint: Endpoint,
     downloader: Downloader,
     access: Arc<Mutex<Access>>,
-    /// transfer ids being fetched right now (no double fetch of one id)
-    fetching: Arc<Mutex<HashSet<String>>>,
+    /// Transfer ids being fetched right now (no double fetch of one id).
+    /// B2b-2: with a handle, so `cancel` can stop the running task.
+    fetching: Arc<Mutex<HashMap<String, Option<AbortHandle>>>>,
     /// B2b-1: offers.json / fetches.json
     state: Arc<State>,
     /// B2b-1: set when peer-app is shutting down, so interrupted fetches
@@ -163,13 +209,12 @@ impl Blobs {
 
         let protocol = BlobsProtocol::new(&store, Some(events));
         let downloader = store.downloader(endpoint);
-
         let blobs = Blobs {
             store,
             endpoint: endpoint.clone(),
             downloader,
             access,
-            fetching: Arc::new(Mutex::new(HashSet::new())),
+            fetching: Arc::new(Mutex::new(HashMap::new())),
             state,
             stopping: Arc::new(AtomicBool::new(false)),
         };
@@ -181,13 +226,21 @@ impl Blobs {
         self.stopping.store(true, Ordering::SeqCst);
     }
 
+    fn is_fetching(&self, id: &str) -> bool {
+        self.fetching.lock().unwrap().contains_key(id)
+    }
+
     // ------------------------------------------------------- restart (B2b-1)
 
     /// Sender side, at startup: bring saved offers back. An offer whose file
-    /// changed or disappeared while peer-app was off is dropped.
+    /// changed or disappeared while peer-app was off is dropped. Expired
+    /// offers are skipped (the expiry check removes them a moment later).
     pub async fn restore_offers(&self) -> usize {
         let mut restored = 0;
         for (id, rec) in self.state.offers() {
+            if expired_now(rec.created_ms) {
+                continue;
+            }
             match self.check_offer(&id, &rec).await {
                 Ok(hash) => {
                     let allowed: HashSet<EndpointId> =
@@ -251,9 +304,13 @@ impl Blobs {
     }
 
     /// Receiver side, at startup: continue every saved, unfinished fetch.
+    /// Expired ones are skipped (the expiry check removes them).
     pub fn restore_fetches(&self) -> usize {
         let mut restored = 0;
         for (id, rec) in self.state.fetches() {
+            if expired_now(rec.created_ms) {
+                continue;
+            }
             match FetchRequest::from_record(&id, &rec) {
                 Ok(req) => {
                     self.fetch(req);
@@ -268,6 +325,65 @@ impl Blobs {
             }
         }
         restored
+    }
+
+    // -------------------------------------------------------- expiry (B2b-2)
+
+    /// Starts the background check that removes expired shares and fetches.
+    pub fn start_expiry(&self) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(EXPIRY_CHECK_SECS)).await;
+                if this.stopping.load(Ordering::SeqCst) {
+                    break;
+                }
+                this.expire_old().await;
+            }
+        });
+    }
+
+    async fn expire_old(&self) {
+        for (id, rec) in self.state.offers() {
+            if expired_now(rec.created_ms) {
+                self.expire_offer(&id).await;
+            }
+        }
+        // A fetch that is running (or doing its quick tries) is left alone;
+        // it stops trying once expired and is cleaned up then.
+        for (id, rec) in self.state.fetches() {
+            if expired_now(rec.created_ms) && !self.is_fetching(&id) {
+                self.expire_fetch(&id).await;
+            }
+        }
+    }
+
+    async fn expire_offer(&self, id: &str) {
+        self.access.lock().unwrap().offers.remove(id);
+        if let Err(e) = self.state.remove_offer(id) {
+            report_state_error(e);
+        }
+        let _ = self.store.tags().delete(tag_out(id)).await;
+        println!("EVENT:OFFER_EXPIRED:{id}");
+    }
+
+    async fn expire_fetch(&self, id: &str) {
+        if let Err(e) = self.state.remove_fetch(id) {
+            report_state_error(e);
+        }
+        self.drop_fetch_data(id).await;
+        println!("EVENT:FETCH_EXPIRED:{id}");
+        println!(
+            "EVENT:TRANSFER_FAILED:{id}:expired after {}s without finishing",
+            transfer_ttl_secs()
+        );
+    }
+
+    /// Removes the tag (so garbage collection deletes the chunks) and any
+    /// leftover partial file.
+    async fn drop_fetch_data(&self, id: &str) {
+        let _ = self.store.tags().delete(tag_in(id)).await;
+        let _ = tokio::fs::remove_file(format!("received_{id}.partial")).await;
     }
 
     // ---------------------------------------------------------------- sender
@@ -316,7 +432,6 @@ impl Blobs {
             .await
             .map_err(|e| anyhow!("could not hash file: {e}"))?;
         let ms = started.elapsed().as_millis();
-
         {
             let mut access = self.access.lock().unwrap();
             if access.offers.contains_key(transfer_id) {
@@ -383,8 +498,9 @@ impl Blobs {
     // -------------------------------------------------------------- receiver
 
     /// `fetch …`: pull the blob from the sender, then save it as a file.
-    /// Ends with FILE_RECEIVED (+ TRANSFER_PATH) or TRANSFER_FAILED, the
-    /// same result events as META3. A failed fetch keeps its chunks.
+    /// Ends with FILE_RECEIVED (+ TRANSFER_PATH). On failure: up to 3 quick
+    /// tries by itself (FETCH_RETRYING), then FETCH_WAITING (chunks kept,
+    /// `retry` continues it).
     pub fn fetch(&self, req: FetchRequest) {
         let id = req.transfer_id.clone();
         let saved = self.state.fetch(&id);
@@ -396,13 +512,16 @@ impl Blobs {
         }
         {
             let mut fetching = self.fetching.lock().unwrap();
-            if !fetching.insert(id.clone()) {
+            if fetching.contains_key(&id) {
                 println!("EVENT:ERROR:fetch {id}: already fetching");
                 return;
             }
+            fetching.insert(id.clone(), None);
         }
 
         // B2b-1: remember it before starting, so a restart continues it.
+        // A retry keeps the original created time, so the 30 min limit
+        // counts from the first fetch, not from the last retry.
         let record = FetchRecord {
             hash: req.hash.to_string(),
             size: req.size,
@@ -415,8 +534,35 @@ impl Blobs {
         }
 
         let this = self.clone();
-        tokio::spawn(async move {
-            let result = this.do_fetch(&req).await;
+        let task_id = id.clone();
+        let task = tokio::spawn(async move {
+            let id = task_id;
+            let mut result = this.do_fetch(&req).await;
+
+            // B2b-2: quick tries for short hiccups. Each one resumes from
+            // the chunks already received. Stops early if peer-app is
+            // stopping, the fetch was cancelled, or its time is over.
+            for (n, secs) in QUICK_RETRY_SECS.iter().enumerate() {
+                let Err(reason) = &result else { break };
+                if this.stopping.load(Ordering::SeqCst) {
+                    break;
+                }
+                match this.state.fetch(&id) {
+                    Some(rec) if !expired_now(rec.created_ms) => {}
+                    _ => break, // cancelled or expired
+                }
+                println!(
+                    "EVENT:FETCH_RETRYING:{id}:{}:{secs}:{}",
+                    n + 1,
+                    clean(reason)
+                );
+                tokio::time::sleep(Duration::from_secs(*secs)).await;
+                if this.stopping.load(Ordering::SeqCst) {
+                    break;
+                }
+                result = this.do_fetch(&req).await;
+            }
+
             this.fetching.lock().unwrap().remove(&id);
             match result {
                 Ok(()) => {
@@ -428,15 +574,91 @@ impl Blobs {
                     // Interrupted by shutdown: kept, resumes on restart.
                     println!("EVENT:FETCH_PAUSED:{id}:peer-app is stopping, resumes on restart");
                 }
-                Err(reason) => {
-                    // B2b-1: entry and chunks are kept, so the same fetch
-                    // again (or a restart) continues from here.
-                    println!(
-                        "EVENT:TRANSFER_FAILED:{id}:{} (partial data kept; the same fetch again resumes)",
-                        clean(&reason)
-                    );
-                }
+                Err(reason) => this.wait_or_expire(&id, &reason).await,
             }
+        });
+        // Keep the handle so `cancel` can stop it (only if it is still running).
+        if let Some(slot) = self.fetching.lock().unwrap().get_mut(&id) {
+            *slot = Some(task.abort_handle());
+        }
+    }
+
+    /// B2b-2: after the quick tries failed, wait for a `retry` instead of
+    /// giving up, unless its time is already over.
+    async fn wait_or_expire(&self, id: &str, reason: &str) {
+        let Some(rec) = self.state.fetch(id) else {
+            return; // cancelled meanwhile
+        };
+        let now = now_ms();
+        if is_expired(rec.created_ms, now, ttl_ms()) {
+            self.expire_fetch(id).await;
+        } else {
+            println!(
+                "EVENT:FETCH_WAITING:{id}:{}:{} (partial data kept; 'retry {id}' continues it)",
+                secs_left(rec.created_ms, now, ttl_ms()),
+                clean(reason)
+            );
+        }
+    }
+
+    /// `retry <id>`: start a waiting fetch again; it resumes from the chunks
+    /// it already has.
+    pub fn retry(&self, id: &str) {
+        if self.is_fetching(id) {
+            println!("EVENT:ERROR:retry {id}: already fetching");
+            return;
+        }
+        let Some(rec) = self.state.fetch(id) else {
+            println!("EVENT:ERROR:retry {id}: no waiting fetch with this id");
+            return;
+        };
+        if expired_now(rec.created_ms) {
+            println!("EVENT:ERROR:retry {id}: expired");
+            return;
+        }
+        match FetchRequest::from_record(id, &rec) {
+            Ok(req) => {
+                println!("EVENT:RETRY:{id}");
+                self.fetch(req);
+            }
+            Err(reason) => println!("EVENT:ERROR:retry {id}: {}", clean(&reason)),
+        }
+    }
+
+    /// `retry all`: start every waiting (not running, not expired) fetch.
+    pub fn retry_all(&self) {
+        let mut started = 0;
+        for (id, rec) in self.state.fetches() {
+            if self.is_fetching(&id) || expired_now(rec.created_ms) {
+                continue;
+            }
+            if let Ok(req) = FetchRequest::from_record(&id, &rec) {
+                println!("EVENT:RETRY:{id}");
+                self.fetch(req);
+                started += 1;
+            }
+        }
+        println!("EVENT:RETRY_ALL:{started}");
+    }
+
+    /// `cancel <id>`: stop a running or waiting fetch and delete its data.
+    pub fn cancel(&self, id: String) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let running = this.fetching.lock().unwrap().remove(&id);
+            let saved = this.state.fetch(&id).is_some();
+            if running.is_none() && !saved {
+                println!("EVENT:ERROR:cancel {id}: no fetch with this id");
+                return;
+            }
+            if let Some(Some(handle)) = running {
+                handle.abort();
+            }
+            if let Err(e) = this.state.remove_fetch(&id) {
+                report_state_error(e);
+            }
+            this.drop_fetch_data(&id).await;
+            println!("EVENT:FETCH_CANCELLED:{id}");
         });
     }
 
@@ -638,7 +860,16 @@ impl PathWatch {
     async fn stop(self) -> Option<&'static str> {
         self.task.abort();
         let now = current_path(&self.endpoint, self.peer).await;
-        now.or(*self.last.lock().unwrap())
+        let last = *self.last.lock().unwrap();
+        now.or(last)
+    }
+}
+
+/// B2b-2: if a fetch is cancelled mid-download, the watcher is dropped
+/// without stop(); this makes sure its polling task ends too.
+impl Drop for PathWatch {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -782,5 +1013,15 @@ mod tests {
         assert!(FetchRequest::from_record("t1", &bad_sender).is_err());
 
         assert!(FetchRequest::from_record("../x", &good).is_err());
+    }
+
+    #[test]
+    fn expiry_math() {
+        let ttl = 30_000; // 30 s
+        assert!(!is_expired(1_000, 1_000, ttl));
+        assert!(!is_expired(1_000, 30_999, ttl));
+        assert!(is_expired(1_000, 31_000, ttl));
+        assert_eq!(secs_left(1_000, 11_000, ttl), 20);
+        assert_eq!(secs_left(1_000, 99_000, ttl), 0);
     }
 }
