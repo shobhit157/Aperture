@@ -4,9 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-iroh = "1.0.2"
+# B2: pinned exactly. iroh-blobs is still 0.x, so check release notes before
+# any upgrade (both versions must stay compatible with each other).
+iroh = "=1.0.2"
+iroh-blobs = "=0.103.1"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 anyhow = "1.0"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 blake3 = "1"
+# B2b: the memory files (offers.json, fetches.json)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
