@@ -1,7 +1,8 @@
 # peer-app Protocol
 
 > How Aperture's peer-app talks — to the Java client, and to other peer-apps —
-> and how it got this shape. Current version: **META3** (Phase A4).
+> and how it got this shape. Current versions: **META3** (Phase A4, still used by Java)
+> and **iroh-blobs** (Phase B2, peer-app ready; Java switches in B3).
 
 ## The big picture
 
@@ -11,18 +12,21 @@ two computers. It never talks to the user directly. It speaks two "languages":
 ```mermaid
 flowchart LR
   J1[Java client A] -- "1. commands (stdin)<br/>2. events (stdout)" --> P1[peer-app A]
-  P1 == "3. transfer protocol<br/>(QUIC, peer to peer)" ==> P2[peer-app B]
+  P1 == "3. META3 push, or<br/>4. iroh-blobs fetch<br/>(QUIC, peer to peer)" ==> P2[peer-app B]
   P2 -- "events (stdout)" --> J2[Java client B]
 ```
 
 | Part | Between | How | Example |
 |---|---|---|---|
-| Commands | Java → peer-app | lines on stdin | `sendto t1 <id> <relay> /path/file` |
+| Commands | Java → peer-app | lines on stdin | `sendto t1 <id> <relay> /path/file` · `fetch t1 <hash> …` |
 | Events | peer-app → Java | lines on stdout | `EVENT:FILE_RECEIVED:t1:…` |
-| Transfer protocol | peer-app ↔ peer-app | bytes on a QUIC stream | `META3|t1|5242880|photo.jpg` … |
+| META3 transfer | peer-app ↔ peer-app | bytes on a QUIC stream (ALPN `p2papp/file/0`) | `META3|t1|5242880|photo.jpg` … |
+| Blobs transfer | peer-app ↔ peer-app | iroh-blobs protocol (receiver pulls) | verified chunks, resumable |
 
 The signaling server never sees file data. It only helps two clients find
 each other (endpoint ID + relay URL). The file goes peer to peer.
+
+Both protocols run on **one** Iroh endpoint with **one** identity (B0), routed by ALPN.
 
 ---
 
@@ -30,14 +34,17 @@ each other (endpoint ID + relay URL). The file goes peer to peer.
 
 | Command | Meaning |
 |---|---|
-| `sendto <transfer_id> <endpoint_id> <relay_url> <file_path>` | Send a file to that peer |
+| `sendto <transfer_id> <endpoint_id> <relay_url> <file_path>` | Send a file to that peer (META3) |
 | `sendto <transfer_id> <endpoint_id> - <file_path>` | Same, without a relay hint (dial by ID only) |
 | `quit` | Shut down |
+
+Blobs commands (`share`, `allow`, `unshare`, `fetch`, `retry`, `cancel`) are in **Part 4**.
 
 - `transfer_id`: letters, digits, `-`, `_`, max 64 chars (Java uses UUIDs).
 - `relay_url` is only a **hint** — Iroh's discovery finds the peer by its ID
   even if the URL is wrong (tested: bug 10).
 - `file_path` may contain spaces (it is the last field).
+- Ctrl+C or SIGTERM (Kubernetes, Java's `destroy()`) = `quit`: peer-app saves its state and exits (B2b-1).
 
 ## Part 2: Events (peer-app → Java)
 
@@ -48,18 +55,22 @@ or ignores the rest.
 
 | Event | Meaning |
 |---|---|
-| `EVENT:ENDPOINT_READY:<endpoint_id>` | My Iroh identity |
+| `EVENT:IDENTITY:<created\|loaded\|…>:<where>` | Where my key came from (key file in the data folder, or seed) — B0 |
+| `EVENT:BLOB_STORE:<path>` | My blob store folder — B2 |
+| `EVENT:ENDPOINT_READY:<endpoint_id>` | My Iroh identity (same every start since B0) |
 | `EVENT:RELAY_READY:<relay_url>` | My home relay |
 | `EVENT:ENDPOINT_ADDRS:<ip:port,…>` | Direct addresses I know (local + public) — for debugging relay vs direct |
-| `EVENT:CHUNK_SIZE:<bytes>` | Read/write chunk size in use |
-| `EVENT:READY_FOR_COMMANDS:` | Ready for `sendto` |
+| `EVENT:CHUNK_SIZE:<bytes>` | Read/write chunk size in use (META3) |
+| `EVENT:TRANSFER_TTL:<seconds>` | How long shares and fetches live — B2b-2 |
+| `EVENT:RESTORED:<offers>:<fetches>` | Saved shares / unfinished fetches brought back after a restart — B2b-1 |
+| `EVENT:READY_FOR_COMMANDS:` | Ready for commands |
 
 ### During a transfer
 
 | Event | Side | Meaning |
 |---|---|---|
 | `EVENT:PROGRESS:sending\|<name>\|<pct>\|<bytes>\|<total>\|<id>` | sender | Progress (max ~100 lines per transfer) |
-| `EVENT:PROGRESS:receiving\|…` | receiver | Same, receiving side |
+| `EVENT:PROGRESS:receiving\|…` | receiver | Same, receiving side (blobs: includes bytes already on disk) |
 | `EVENT:CONNECTION_PATH:<id>:<direct\|relay>` | both | Live path — at start and on every switch |
 | `EVENT:FILE_HASH:<id>:blake3:<hex>` | both | Hash each side computed |
 
@@ -69,10 +80,10 @@ or ignores the rest.
 |---|---|---|---|
 | `EVENT:FILE_RECEIVED:<id>:<saved_path>\|<bytes>` | receiver | Saved, hash OK | — |
 | `EVENT:TRANSFER_PATH:<id>:<direct\|relay>` | receiver | Final path (only after success) | counts **one** success metric |
-| `EVENT:TRANSFER_TIMING:<id>:data_ms=… sync_ms=…` | receiver | Where the time went | ignores |
-| `EVENT:TRANSFER_FAILED:<id>:<reason>` | receiver | Receiver failed (incomplete, hash mismatch, disk…) | reports failure |
-| `EVENT:FILE_SENT:<id>:<path>` | sender | Receiver confirmed OK | — |
-| `EVENT:FILE_SEND_FAILED:<id>:<reason>` | sender | Receiver failed and **already reported it** | does not report again |
+| `EVENT:TRANSFER_TIMING:<id>:data_ms=… …` | receiver | Where the time went (blobs adds `export_ms`, `resumed_bytes`, `protocol=blobs`) | ignores |
+| `EVENT:TRANSFER_FAILED:<id>:<reason>` | receiver | Receiver failed (incomplete, hash mismatch, disk, expired…) | reports failure |
+| `EVENT:FILE_SENT:<id>:<path>` | sender | Receiver confirmed OK (META3) | — |
+| `EVENT:FILE_SEND_FAILED:<id>:<reason>` | sender | Receiver failed and **already reported it** (META3) | does not report again |
 | `EVENT:TRANSFER_FAILED:<id>:sender: <reason>` | sender | Failure only the sender knows (can't connect, rejected, no reply) | reports failure |
 
 ### Other
@@ -80,6 +91,7 @@ or ignores the rest.
 | Event | Meaning |
 |---|---|
 | `EVENT:INCOMING_REJECTED:<reason>` | Someone connected but sent a bad header / handshake failed. No transfer ID yet |
+| `EVENT:SHUTDOWN:signal` | Ctrl+C / SIGTERM received; saving and exiting — B2b-1 |
 | `EVENT:ERROR:<message>` | Bad command or startup problem (not tied to a transfer) |
 
 **The golden rule (from A1):** every transfer is reported **once** —
@@ -87,7 +99,7 @@ success by the receiver, failure by whichever side knows about it.
 
 ---
 
-## Part 3: Transfer protocol (peer-app ↔ peer-app)
+## Part 3: META3 transfer protocol (peer-app ↔ peer-app)
 
 One QUIC connection, ALPN `p2papp/file/0`, one bidirectional stream.
 
@@ -146,6 +158,100 @@ sequenceDiagram
 
 ---
 
+## Part 4: Blobs — "share, then fetch" (Phase B2)
+
+The **receiver pulls**; the sender stays passive. iroh-blobs checks every chunk
+against the BLAKE3 hash as it arrives, and chunks already received are kept,
+so a fetch can always continue where it stopped.
+
+```mermaid
+sequenceDiagram
+  participant SJ as Sender Java
+  participant S as Sender peer-app
+  participant R as Receiver peer-app
+  participant RJ as Receiver Java
+  SJ->>S: share t1 /path/file
+  S-->>SJ: EVENT:SHARED:t1:<hash>:<size>
+  SJ->>S: allow t1 <receiver_endpoint_id>
+  Note over SJ,RJ: hash + size + sender ID go to the receiver via the server (B3)
+  RJ->>R: fetch t1 <hash> <size> <sender_endpoint_id> <name>
+  R->>S: get <hash> (verified chunks)
+  S-->>SJ: EVENT:SERVED:t1:<receiver>:<path>
+  R-->>RJ: EVENT:FILE_RECEIVED:t1:… · TRANSFER_PATH · TRANSFER_TIMING
+```
+
+### Commands
+
+| Command | Side | Meaning |
+|---|---|---|
+| `share <id> <file_path>` | sender | Hash the file in place (no copy) and offer it |
+| `allow <id> <endpoint_id>` | sender | This peer may fetch this offer (nobody else can) |
+| `unshare <id>` | sender | Stop offering it |
+| `fetch <id> <hash> <size> <sender_endpoint_id> <name>` | receiver | Pull the file (name last, may contain spaces) |
+| `retry <id>` / `retry all` | receiver | Try a waiting fetch again now (Java sends it when the server says the sender is back) |
+| `cancel <id>` | receiver | Stop a fetch and delete its partial data |
+
+### Events
+
+| Event | Side | Meaning |
+|---|---|---|
+| `EVENT:SHARED:<id>:<hash>:<size>` | sender | Offer ready |
+| `EVENT:SHARE_TIMING:<id>:hash_ms=…` | sender | Time to hash the file |
+| `EVENT:ALLOWED:<id>:<endpoint_id>` | sender | Peer added to the allow-list |
+| `EVENT:UNSHARED:<id>` | sender | Offer removed |
+| `EVENT:SERVED:<id>:<peer>:<direct\|relay>` | sender | The receiver got everything it asked for |
+| `EVENT:PEER_REJECTED:<peer>:<hash or ->` | sender | Someone not on the allow-list tried — refused before any data |
+| `EVENT:OFFER_DROPPED:<id>:<reason>` | sender | At startup: the shared file changed or disappeared while peer-app was off |
+| `EVENT:OFFER_EXPIRED:<id>` | sender | Offer older than the TTL, removed |
+| `EVENT:RESUMED:<id>:<bytes>` | receiver | Continuing with `<bytes>` already on disk |
+| `EVENT:FETCH_RETRYING:<id>:<n>:<secs>:<reason>` | receiver | Quick try `n` of 3 in `<secs>` (5 / 10 / 20 s) |
+| `EVENT:FETCH_WAITING:<id>:<secs_left>:<reason>` | receiver | Quick tries failed; data kept; waiting for `retry` |
+| `EVENT:FETCH_PAUSED:<id>:…` | receiver | Interrupted by shutdown; resumes on the next start |
+| `EVENT:RETRY:<id>` / `EVENT:RETRY_ALL:<n>` | receiver | A retry started |
+| `EVENT:FETCH_CANCELLED:<id>` | receiver | Cancelled, data deleted |
+| `EVENT:FETCH_EXPIRED:<id>` + `EVENT:TRANSFER_FAILED:<id>:expired…` | receiver | TTL reached without finishing; data deleted |
+
+### The data folder
+
+`PEER_DATA_DIR`, default `~/.aperture/<username>/`:
+
+| File / folder | What |
+|---|---|
+| `secret.key` | My identity (0600). Not used when `PEER_KEY_SEED` is set (bots) |
+| `blobs/` | iroh-blobs store; data without a tag is garbage-collected every 60 s |
+| `offers.json` | My shares (file path, size, modified time, allowed peers, created time) |
+| `fetches.json` | My unfinished fetches (hash, size, sender, name, created time) |
+
+Saved with temp file → rename; a damaged file is moved to `*.bad` and peer-app starts empty.
+
+### Settings
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PEER_DATA_DIR` | `~/.aperture/<username>` | Data folder |
+| `PEER_KEY_SEED` | — | Derive the key from a seed (bots: same ID per bot name without a key file) |
+| `PEER_TRANSFER_TTL_SECS` | `1800` | Lifetime of shares and fetches |
+| `PEER_BINARY_PATH` | — | (Java) which peer-app binary to start |
+
+### Lifecycle of a fetch
+
+```mermaid
+flowchart LR
+  F[fetch] --> D{download}
+  D -- ok --> OK[FILE_RECEIVED]
+  D -- fails --> Q[3 quick tries<br/>5 / 10 / 20 s]
+  Q -- one works --> OK
+  Q -- all fail --> W[FETCH_WAITING]
+  W -- retry --> D
+  W -- cancel --> C[FETCH_CANCELLED]
+  W -- TTL reached --> E[FETCH_EXPIRED]
+  D -- Ctrl+C / SIGTERM --> P[FETCH_PAUSED<br/>resumes on restart]
+```
+
+Tested with `tools/blobs-test.sh` (8 scenarios, all pass).
+
+---
+
 ## How it got this shape
 
 Each version fixed something we **measured first** with
@@ -153,7 +259,7 @@ Each version fixed something we **measured first** with
 
 ```mermaid
 flowchart LR
-  V0["v0<br/>META|name|size|id<br/>reply: ACK"] --> A1["A1<br/>reply: OK / FAIL<br/>one result per transfer"] --> A2["A2 · META2<br/>META2|id|size|name<br/>REJECTED, limits,<br/>safe file names"] --> A3["A3 · META3<br/>+ HASH|blake3 line"] --> A4["A4<br/>progress throttled,<br/>stop if file changes,<br/>timing + addresses"]
+  V0["v0<br/>META|name|size|id<br/>reply: ACK"] --> A1["A1<br/>reply: OK / FAIL<br/>one result per transfer"] --> A2["A2 · META2<br/>META2|id|size|name<br/>REJECTED, limits,<br/>safe file names"] --> A3["A3 · META3<br/>+ HASH|blake3 line"] --> A4["A4<br/>progress throttled,<br/>stop if file changes,<br/>timing + addresses"] --> B0["B0<br/>same identity<br/>every start"] --> B2["B2<br/>iroh-blobs: share/fetch,<br/>resume, retry, expiry"]
 ```
 
 | Version | Problem (bug #) | Change | Why this way |
@@ -163,6 +269,8 @@ flowchart LR
 | **A2** | Same name from two senders corrupted the file (5); no sync before rename (6); `|` in a name broke the header (8); unlimited header (12) | New header **META2** with the **name last**; per-transfer `.partial`; names cleaned; 1 KB header limit; `REJECTED` reply | Name last → `splitn(3)` keeps `|` inside the name. Version tag → mismatched builds fail clearly instead of silently |
 | **A3** | No integrity check (7) | **META3** + `HASH|blake3|…` **after** the data | Hash while streaming → file read only once. BLAKE3 is fast and is what iroh-blobs uses |
 | **A4** | 16,000 progress lines per 500 MB (11); file changing mid-send produced confusing errors | Progress max ~100 lines; sender sends exactly `size` bytes and stops if the file shrinks; `TRANSFER_TIMING`, `ENDPOINT_ADDRS` | Less noise for Java; clear reason; data to explain relay vs direct |
+| **B0** | New ID on every restart: nobody could find a peer that came back | Key in the data folder or derived from a seed; one `Router` for all protocols | Same ID = others can reconnect; bots get stable IDs without volumes |
+| **B2** | No resume; a restart or offline sender lost the whole transfer | iroh-blobs share/fetch, allow-list, saved state, quick tries, waiting, retry, cancel, TTL, clean shutdown | Verified chunks and resume from the library; we add who-may-fetch, persistence and waiting |
 
 ### Design rules that came out of this
 
@@ -171,19 +279,21 @@ flowchart LR
 3. **Never trust the other side**: limit sizes, clean names, verify the hash.
 4. **Version the header** — mismatched builds must fail loudly.
 5. **Measure before and after** every change.
+6. **Saving isn't exiting** — after saving, exit explicitly (B2b-1 stdin hang).
+7. **Retry short hiccups yourself; let the server trigger long waits** (B2b-2).
 
 ## Compatibility
 
-- Both peers must run the **same header version** (META3). An older peer
+- META3: both peers must run the **same header version**. An older peer
   gets `REJECTED: different header version`.
 - After building, update **both** copies: `peer-binary/peer` (bot image) and
   `~/peer-app/target/release/peer` (admin client), or set `PEER_BINARY_PATH`.
+  Current binary: B2 (`8b386b…`), image `shobhit3718/dummy-client:b2`.
 
 ## What comes next
 
-- **Step 0 (mesh):** `CONNECTION_PATH` from `paths_stream()` so the path is
-  known at the start of a transfer.
-- **Phase B (iroh-blobs):** Part 3 is replaced by "share, then fetch": the
-  sender shares a hash + ticket, the receiver fetches and verifies chunk by
-  chunk, with resume. Parts 1 and 2 stay, with new commands (`share`, `fetch`).
-  See `docs/future-plans/file-transfer-improvement-plan.md`.
+- **B3:** the Java client switches from `sendto` (META3) to `share` / `allow` / `fetch`;
+  the server passes hash + size + sender ID to the receiver and announces when a
+  sender is back (→ `retry`).
+- **B5:** META3 (Part 3) is removed.
+- See `docs/future-plans/File-transfer-improvement-plan.md`.
