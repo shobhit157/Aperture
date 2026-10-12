@@ -350,13 +350,23 @@ public class Client {
                 }
 
                 if (line.startsWith("FILE_REQUEST|")) {
-                    // FILE_REQUEST|<from>|<filename>|<size>|<transferId>
-                    String[] parts = line.split("\\|", 5);
+                    // FILE_REQUEST|<from>|<filename>|<size>|<id>|<hash>|<senderEndpoint>|<senderRelay>
+                    // B3a: hash is empty for meta3 (then it's a push).
+                    String[] parts = line.split("\\|", -1);
                     String from = parts[1];
                     String name = parts.length > 2 ? parts[2] : "file";
                     long size = parts.length > 3 ? parseLong(parts[3]) : 0;
-                    String transferId = parts.length > 4 ? parts[4] : UUID.randomUUID().toString();
-                    transfers.onIncomingRequest(transferId, from, name, size);
+                    String transferId = parts.length > 4 && !parts[4].isEmpty() ? parts[4] : UUID.randomUUID().toString();
+                    String hash = parts.length > 5 ? parts[5] : "";
+                    String senderEndpoint = parts.length > 6 ? parts[6] : "";
+                    transfers.onIncomingRequest(transferId, from, name, size, hash, senderEndpoint);
+
+                } else if (line.startsWith("FILE_READY|")) {
+                    // B3a: FILE_READY|<sender>|<id> — fetch now.
+                    String[] parts = line.split("\\|", 3);
+                    if (parts.length == 3) {
+                        transfers.onFileReady(parts[1], parts[2]);
+                    }
 
                 } else if (line.startsWith("PEER_INFO|")) {
                     // PEER_INFO|<receiver>|<endpointId>|<relayUrl>|<transferId>
@@ -400,7 +410,7 @@ public class Client {
                                 default -> "bot_medium.bin";
                             };
 
-                            // Mesh v2 S2: queued — this bot sends one at a time.
+                            // B3a: queued — at most MAX_SENDS are prepared at once.
                             for (String recipient : recipients) {
                                 transfers.queueSend(recipient, fileName);
                             }
@@ -478,10 +488,22 @@ public class Client {
     }
 
     // =====================================================================
-    // Mesh v2 S2: file transfers — 1 sending + 1 receiving at a time.
+    // File transfers (Mesh v2 S2, B3a).
     //
     // Everything is keyed by TRANSFER ID (never by username), so two files
     // to the same user can't be mixed up. Extra transfers wait in a queue.
+    //
+    // B3a: two ways to move a file, chosen by the SENDER:
+    //   blobs (default): share -> FILE_REQUEST with hash -> (accept) ->
+    //                    PEER_INFO -> allow -> FILE_READY -> receiver fetches
+    //   meta3 (fallback, TRANSFER_PROTOCOL=meta3): FILE_REQUEST without hash
+    //                    -> (accept) -> PEER_INFO -> sender pushes (sendto)
+    // A receiver handles both: a request WITH a hash is blobs.
+    //
+    // Limits: at most MAX_SENDS being prepared/requested and MAX_RECEIVES
+    // being received at the same time (default 2 + 2). A blobs sender's
+    // slot is freed after FILE_READY: from then on its peer-app serves the
+    // file by itself, so the sender doesn't need a slot.
     //
     // Events to the server use one message type, with key=value fields:
     //   TRANSFER_EVENT|id=<id>|state=<path|progress|done|failed>|path=..|pct=..|reason=..
@@ -490,12 +512,22 @@ public class Client {
     static class Transfers {
 
         static final long TICK_MS = 5_000;
-        // Accepted, but the sender's peer-app never connected.
+        // Accepted, but the sender never connected (meta3) / never got ready (blobs).
         static final long ACCEPT_TIMEOUT_MS = 60_000;
         // Our request was never accepted (receiver busy for a long time).
         static final long REQUEST_TIMEOUT_MS = 15 * 60_000;
+        // B3a: peer-app is hashing the file (big files take a while).
+        static final long SHARE_TIMEOUT_MS = 10 * 60_000;
+        // B3a: allow sent, no ALLOWED back.
+        static final long ALLOW_TIMEOUT_MS = 60_000;
         // Progress to the server: receiver side only, at most every 3 s.
         static final long PROGRESS_FORWARD_MS = 3_000;
+
+        // B3a: settings (environment variables).
+        static final boolean USE_BLOBS =
+                !"meta3".equalsIgnoreCase(System.getenv().getOrDefault("TRANSFER_PROTOCOL", "blobs"));
+        static final int MAX_SENDS = envInt("MAX_SENDS", 2);
+        static final int MAX_RECEIVES = envInt("MAX_RECEIVES", 2);
 
         enum Dir { SEND, RECEIVE }
 
@@ -503,10 +535,16 @@ public class Client {
             final String id;
             final Dir dir;
             final String peer;      // the other user
-            final String name;      // file name (for the screen)
-            final String filePath;  // SEND only
+            final String name;      // file name (no '|', safe for messages)
+            final String filePath;  // SEND only (absolute)
             final long size;
-            String phase = "queued"; // queued -> requested/accepted -> moving
+            // send:    queued -> sharing -> requested -> allowing -> serving   (blobs)
+            //          queued -> requested -> accepted -> moving               (meta3)
+            // receive: queued -> accepted -> fetching / moving
+            String phase = "queued";
+            String hash = "";           // blobs: from SHARED (send) or from the request (receive)
+            String senderEndpoint = ""; // receive, blobs: where to fetch from
+            boolean shared = false;     // send, blobs: peer-app holds an offer for it
             String path = "";
             int pct = 0;
             int lastMilestone = 0;
@@ -521,14 +559,18 @@ public class Client {
                 this.filePath = filePath;
                 this.size = size;
             }
+
+            boolean isBlobs() {
+                return !hash.isEmpty();
+            }
         }
 
         private final Object lock = new Object();
         private final Map<String, Transfer> byId = new ConcurrentHashMap<>();
         private final Deque<Transfer> sendQueue = new ArrayDeque<>();
         private final Deque<Transfer> receiveQueue = new ArrayDeque<>();
-        private Transfer activeSend;
-        private Transfer activeReceive;
+        private final List<Transfer> activeSends = new ArrayList<>();
+        private final List<Transfer> activeReceives = new ArrayList<>();
 
         private PrintWriter[] currentOut;
         private PrintWriter peerWriter;
@@ -536,6 +578,8 @@ public class Client {
         void init(PrintWriter[] currentOut, PrintWriter peerWriter) {
             this.currentOut = currentOut;
             this.peerWriter = peerWriter;
+            say("[transfers] protocol=" + (USE_BLOBS ? "blobs" : "meta3")
+                    + " max_sends=" + MAX_SENDS + " max_receives=" + MAX_RECEIVES);
         }
 
         // ---------------- sending ----------------
@@ -546,12 +590,14 @@ public class Client {
                 System.out.println("File not found: " + filePath);
                 return;
             }
+            // '|' separates message fields, so it can't be part of a name.
+            String safeName = f.getName().replace('|', '_');
             Transfer t = new Transfer(UUID.randomUUID().toString(), Dir.SEND, target,
-                    f.getName(), filePath, f.length());
+                    safeName, f.getAbsolutePath(), f.length());
             synchronized (lock) {
                 byId.put(t.id, t);
                 sendQueue.addLast(t);
-                if (activeSend != null) {
+                if (activeSends.size() >= MAX_SENDS) {
                     say("[send] " + t.name + " -> " + t.peer + "   queued (position " + sendQueue.size() + ")");
                 }
                 startNextSend();
@@ -560,45 +606,138 @@ public class Client {
 
         // Caller holds lock.
         private void startNextSend() {
-            if (activeSend != null || sendQueue.isEmpty()) return;
-            PrintWriter out = out();
-            if (out == null) return; // not connected — the ticker retries
-            Transfer t = sendQueue.pollFirst();
-            activeSend = t;
+            while (activeSends.size() < MAX_SENDS && !sendQueue.isEmpty()) {
+                PrintWriter out = out();
+                if (out == null) return; // not connected — the ticker retries
+                Transfer t = sendQueue.pollFirst();
+                activeSends.add(t);
+                t.lastActivity = System.currentTimeMillis();
+                if (USE_BLOBS) {
+                    // B3a step 1: hash the file first; FILE_REQUEST goes out on SHARED.
+                    t.phase = "sharing";
+                    t.shared = true;
+                    peerWriter.println("share " + t.id + " " + t.filePath);
+                    say("[send] " + t.name + " -> " + t.peer + "   preparing (" + human(t.size) + ")");
+                } else {
+                    sendRequest(t, out);
+                }
+            }
+        }
+
+        // Caller holds lock. B3a step 2: the request (with the hash in blobs mode).
+        private void sendRequest(Transfer t, PrintWriter out) {
             t.phase = "requested";
             t.lastActivity = System.currentTimeMillis();
-            out.println("FILE_REQUEST|" + t.peer + "|" + t.name + "|" + t.size + "|" + t.id);
+            out.println("FILE_REQUEST|" + t.peer + "|" + t.name + "|" + t.size + "|" + t.id
+                    + (t.isBlobs() ? "|" + t.hash : ""));
             say("[send] " + t.name + " -> " + t.peer + "   requested (" + human(t.size) + ")");
         }
 
+        // EVENT:SHARED:<id>:<hash>:<size>
+        private void onShared(String id, String hash) {
+            synchronized (lock) {
+                Transfer t = byId.get(id);
+                if (t == null || !t.phase.equals("sharing")) return;
+                t.hash = hash;
+                PrintWriter out = out();
+                if (out == null) {
+                    t.phase = "shared"; // not connected — the ticker sends the request
+                    return;
+                }
+                sendRequest(t, out);
+            }
+        }
+
+        // B3a step 3: the receiver accepted; PEER_INFO carries its endpoint.
         void onPeerInfo(String id, String endpointId, String relayUrl) {
             synchronized (lock) {
                 Transfer t = byId.get(id);
-                if (t == null || t != activeSend || !t.phase.equals("requested")) return;
-                t.phase = "accepted";
+                if (t == null || !activeSends.contains(t) || !t.phase.equals("requested")) return;
                 t.lastActivity = System.currentTimeMillis();
-                String relay = (relayUrl == null || relayUrl.isBlank() || relayUrl.equals("null")) ? "-" : relayUrl;
-                peerWriter.println("sendto " + t.id + " " + endpointId + " " + relay + " " + t.filePath);
-                say("[send] " + t.name + " -> " + t.peer + "   started");
+                if (t.isBlobs()) {
+                    // B3a step 4a: only this receiver may fetch this file.
+                    t.phase = "allowing";
+                    peerWriter.println("allow " + t.id + " " + endpointId);
+                    say("[send] " + t.name + " -> " + t.peer + "   accepted, allowing");
+                } else {
+                    t.phase = "accepted";
+                    String relay = (relayUrl == null || relayUrl.isBlank() || relayUrl.equals("null")) ? "-" : relayUrl;
+                    peerWriter.println("sendto " + t.id + " " + endpointId + " " + relay + " " + t.filePath);
+                    say("[send] " + t.name + " -> " + t.peer + "   started");
+                }
+            }
+        }
+
+        // EVENT:ALLOWED:<id>:<endpoint> — B3a step 4b: tell the receiver to fetch.
+        private void onAllowed(String id) {
+            synchronized (lock) {
+                Transfer t = byId.get(id);
+                if (t == null || !t.phase.equals("allowing")) return;
+                PrintWriter out = out();
+                if (out == null) {
+                    t.phase = "allowed"; // not connected — the ticker sends FILE_READY
+                    return;
+                }
+                sendReady(t, out);
+            }
+        }
+
+        // Caller holds lock.
+        private void sendReady(Transfer t, PrintWriter out) {
+            out.println("FILE_READY|" + t.peer + "|" + t.id);
+            t.phase = "serving";
+            t.lastActivity = System.currentTimeMillis();
+            say("[send] " + t.name + " -> " + t.peer + "   ready, " + t.peer + " is fetching");
+            // From here peer-app serves the file by itself: free the slot.
+            activeSends.remove(t);
+            startNextSend();
+        }
+
+        // EVENT:SERVED:<id>:<peer>:<path> — the receiver got everything.
+        private void onServed(String id, String path) {
+            peerWriter.println("unshare " + id);
+            synchronized (lock) {
+                Transfer t = byId.get(id);
+                if (t == null) return; // e.g. an offer restored after a restart
+                t.shared = false;
+                t.path = path;
+                finish(t, true, null, false);
+            }
+        }
+
+        // EVENT:OFFER_EXPIRED:<id> / EVENT:OFFER_DROPPED:<id>:<reason>
+        private void onOfferGone(String id, String reason) {
+            synchronized (lock) {
+                Transfer t = byId.get(id);
+                if (t == null || t.dir != Dir.SEND) return;
+                t.shared = false;
+                finish(t, false, reason, false);
             }
         }
 
         void onRejected(String who) {
             synchronized (lock) {
-                if (activeSend != null && activeSend.peer.equals(who) && activeSend.phase.equals("requested")) {
-                    finish(activeSend, false, "rejected by " + who, false);
+                for (Transfer t : new ArrayList<>(activeSends)) {
+                    if (t.peer.equals(who) && t.phase.equals("requested")) {
+                        finish(t, false, "rejected by " + who, false);
+                        return;
+                    }
                 }
             }
         }
 
         // ---------------- receiving ----------------
 
-        void onIncomingRequest(String id, String from, String name, long size) {
+        // hash and senderEndpoint are empty for a meta3 request.
+        void onIncomingRequest(String id, String from, String name, long size,
+                               String hash, String senderEndpoint) {
             synchronized (lock) {
                 if (byId.containsKey(id)) return; // duplicate
                 Transfer t = new Transfer(id, Dir.RECEIVE, from, name, null, size);
+                t.hash = hash == null ? "" : hash;
+                t.senderEndpoint = senderEndpoint == null ? "" : senderEndpoint;
                 byId.put(id, t);
-                if (activeReceive == null) {
+                if (activeReceives.size() < MAX_RECEIVES) {
                     accept(t);
                 } else {
                     receiveQueue.addLast(t);
@@ -614,17 +753,38 @@ public class Client {
                 receiveQueue.addFirst(t); // not connected — the ticker retries
                 return;
             }
-            activeReceive = t;
+            activeReceives.add(t);
             t.phase = "accepted";
             t.lastActivity = System.currentTimeMillis();
             out.println("FILE_ACCEPT|" + t.peer + "|" + t.id);
-            say("[recv] " + t.name + " <- " + t.peer + "   accepted (" + human(t.size) + ")");
+            say("[recv] " + t.name + " <- " + t.peer + "   accepted (" + human(t.size)
+                    + (t.isBlobs() ? ", blobs" : "") + ")");
         }
 
         // Caller holds lock.
         private void startNextReceive() {
-            if (activeReceive != null || receiveQueue.isEmpty()) return;
-            accept(receiveQueue.pollFirst());
+            while (activeReceives.size() < MAX_RECEIVES && !receiveQueue.isEmpty()) {
+                if (out() == null) return;
+                accept(receiveQueue.pollFirst());
+            }
+        }
+
+        // FILE_READY|<sender>|<id> — B3a step 5: the sender allowed us, fetch now.
+        void onFileReady(String from, String id) {
+            synchronized (lock) {
+                Transfer t = byId.get(id);
+                if (t == null || t.dir != Dir.RECEIVE || !t.phase.equals("accepted") || !t.isBlobs()) return;
+                if (t.senderEndpoint.isEmpty() || t.senderEndpoint.equals("null")) {
+                    finish(t, false, "no address for sender " + from, true);
+                    return;
+                }
+                t.phase = "fetching";
+                t.lastActivity = System.currentTimeMillis();
+                // fetch <id> <hash> <size> <sender_endpoint_id> <name>   (name last: may contain spaces)
+                peerWriter.println("fetch " + t.id + " " + t.hash + " " + t.size + " "
+                        + t.senderEndpoint + " " + t.name);
+                say("[recv] " + t.name + " <- " + t.peer + "   fetching");
+            }
         }
 
         // ---------------- events from peer-app ----------------
@@ -692,9 +852,48 @@ public class Client {
                 }
                 return true;
             }
+
+            // ---- B3a: blobs events ----
+            if (line.startsWith("EVENT:SHARED:")) {
+                // EVENT:SHARED:<id>:<hash>:<size>
+                String[] p = line.substring("EVENT:SHARED:".length()).split(":");
+                if (p.length >= 2) onShared(p[0], p[1]);
+                return true;
+            }
+            if (line.startsWith("EVENT:ALLOWED:")) {
+                onAllowed(idAndRest(line, "EVENT:ALLOWED:")[0]);
+                return true;
+            }
+            if (line.startsWith("EVENT:SERVED:")) {
+                // EVENT:SERVED:<id>:<peer>:<path>
+                String[] p = line.substring("EVENT:SERVED:".length()).split(":");
+                onServed(p[0], p.length >= 3 ? p[2] : "");
+                return true;
+            }
+            if (line.startsWith("EVENT:OFFER_EXPIRED:")) {
+                onOfferGone(idAndRest(line, "EVENT:OFFER_EXPIRED:")[0], "offer expired");
+                return true;
+            }
+            if (line.startsWith("EVENT:OFFER_DROPPED:")) {
+                String[] kv = idAndRest(line, "EVENT:OFFER_DROPPED:");
+                onOfferGone(kv[0], "offer dropped: " + kv[1]);
+                return true;
+            }
+            if (line.startsWith("EVENT:RESUMED:")) {
+                // EVENT:RESUMED:<id>:<bytes already on disk>
+                String[] kv = idAndRest(line, "EVENT:RESUMED:");
+                synchronized (lock) {
+                    Transfer t = byId.get(kv[0]);
+                    if (t != null) say(arrow(t) + "   resuming from " + human(parseLong(kv[1])));
+                }
+                return true;
+            }
+
             // Quiet events: useful in logs, too noisy for the screen.
             return line.startsWith("EVENT:FILE_HASH:")
-                    || line.startsWith("EVENT:TRANSFER_TIMING:");
+                    || line.startsWith("EVENT:TRANSFER_TIMING:")
+                    || line.startsWith("EVENT:SHARE_TIMING:")
+                    || line.startsWith("EVENT:UNSHARED:");
         }
 
         private void onProgress(String id, int pct) {
@@ -726,7 +925,7 @@ public class Client {
                 Transfer t = byId.get(id);
                 if (t == null) return;
                 t.lastActivity = System.currentTimeMillis();
-                if (t.phase.equals("accepted")) t.phase = "moving";
+                if (t.phase.equals("accepted") || t.phase.equals("fetching")) t.phase = "moving";
                 String before = t.path;
                 t.path = path;
                 say(arrow(t) + "   " + (before.isEmpty() ? "path: " + path : "path: " + before + " -> " + path));
@@ -744,6 +943,11 @@ public class Client {
             if (!ok && reportFailure) {
                 sendEvent(t.id, "failed", "reason=" + reason);
             }
+            // B3a: a failed send that still has an offer: close it.
+            if (!ok && t.dir == Dir.SEND && t.shared) {
+                peerWriter.println("unshare " + t.id);
+                t.shared = false;
+            }
             if (ok) {
                 say(arrow(t) + "   done OK" + (t.path.isEmpty() ? "" : " (" + t.path + ")"));
             } else {
@@ -751,26 +955,25 @@ public class Client {
             }
             sendQueue.remove(t);
             receiveQueue.remove(t);
-            if (t == activeSend) {
-                activeSend = null;
-                startNextSend();
-            }
-            if (t == activeReceive) {
-                activeReceive = null;
-                startNextReceive();
-            }
+            activeSends.remove(t);
+            activeReceives.remove(t);
+            startNextSend();
+            startNextReceive();
         }
 
         void onUserLeft(String who) {
             synchronized (lock) {
                 for (Transfer t : new ArrayList<>(byId.values())) {
                     if (!t.peer.equals(who)) continue;
-                    boolean waiting = t.phase.equals("queued") || t.phase.equals("requested");
-                    if (waiting) {
+                    boolean notStarted = t.phase.equals("queued")
+                            || t.phase.equals("sharing") || t.phase.equals("shared")
+                            || t.phase.equals("requested") || t.phase.equals("allowing")
+                            || t.phase.equals("allowed");
+                    if (notStarted) {
                         finish(t, false, who + " left", false);
                     }
-                    // Transfers already moving end on their own: peer-app
-                    // reports the failure, and the server marks it too.
+                    // Transfers already moving (or served by peer-app) end on
+                    // their own: peer-app reports the result, the server marks it.
                 }
             }
         }
@@ -779,13 +982,33 @@ public class Client {
         void tick() {
             synchronized (lock) {
                 long now = System.currentTimeMillis();
-                if (activeReceive != null && activeReceive.phase.equals("accepted")
-                        && now - activeReceive.lastActivity > ACCEPT_TIMEOUT_MS) {
-                    finish(activeReceive, false, "sender never connected", true);
+                for (Transfer t : new ArrayList<>(activeReceives)) {
+                    if (t.phase.equals("accepted") && now - t.lastActivity > ACCEPT_TIMEOUT_MS) {
+                        finish(t, false, t.isBlobs() ? "sender never got ready" : "sender never connected", true);
+                    }
                 }
-                if (activeSend != null && activeSend.phase.equals("requested")
-                        && now - activeSend.lastActivity > REQUEST_TIMEOUT_MS) {
-                    finish(activeSend, false, "request not accepted in time", false);
+                PrintWriter out = out();
+                for (Transfer t : new ArrayList<>(activeSends)) {
+                    long idle = now - t.lastActivity;
+                    switch (t.phase) {
+                        case "sharing" -> {
+                            if (idle > SHARE_TIMEOUT_MS) finish(t, false, "could not prepare the file", false);
+                        }
+                        case "shared" -> {
+                            if (out != null) sendRequest(t, out);
+                        }
+                        case "requested" -> {
+                            if (idle > REQUEST_TIMEOUT_MS) finish(t, false, "request not accepted in time", false);
+                        }
+                        case "allowing" -> {
+                            if (idle > ALLOW_TIMEOUT_MS) finish(t, false, "could not allow the receiver", true);
+                        }
+                        case "allowed" -> {
+                            if (out != null) sendReady(t, out);
+                        }
+                        default -> {
+                        }
+                    }
                 }
                 // After a reconnect, start anything that waited for a connection.
                 startNextSend();
@@ -798,13 +1021,24 @@ public class Client {
         void printStatus() {
             synchronized (lock) {
                 StringBuilder sb = new StringBuilder();
-                sb.append("  [send] sending:   ").append(describe(activeSend))
-                  .append("   (queue: ").append(sendQueue.size()).append(")\n");
+                sb.append("  [send] active (").append(activeSends.size()).append("/").append(MAX_SENDS)
+                  .append("), queue: ").append(sendQueue.size()).append("\n");
+                for (Transfer t : activeSends) {
+                    sb.append("      ").append(describe(t)).append("\n");
+                }
+                for (Transfer t : byId.values()) {
+                    if (t.dir == Dir.SEND && t.phase.equals("serving")) {
+                        sb.append("      ").append(describe(t)).append("\n");
+                    }
+                }
                 for (Transfer t : sendQueue) {
                     sb.append("      waiting: ").append(t.name).append(" -> ").append(t.peer).append("\n");
                 }
-                sb.append("  [recv] receiving: ").append(describe(activeReceive))
-                  .append("   (queue: ").append(receiveQueue.size()).append(")\n");
+                sb.append("  [recv] active (").append(activeReceives.size()).append("/").append(MAX_RECEIVES)
+                  .append("), queue: ").append(receiveQueue.size()).append("\n");
+                for (Transfer t : activeReceives) {
+                    sb.append("      ").append(describe(t)).append("\n");
+                }
                 for (Transfer t : receiveQueue) {
                     sb.append("      waiting: ").append(t.name).append(" <- ").append(t.peer).append("\n");
                 }
@@ -816,6 +1050,7 @@ public class Client {
             if (t == null) return "none";
             String dirArrow = t.dir == Dir.SEND ? " -> " : " <- ";
             return t.name + dirArrow + t.peer + "  " + t.phase
+                    + (t.isBlobs() ? " [blobs]" : " [meta3]")
                     + (t.pct > 0 ? " " + t.pct + "%" : "")
                     + (t.path.isEmpty() ? "" : " (" + t.path + ")");
         }
@@ -859,6 +1094,15 @@ public class Client {
                 return Integer.parseInt(s.trim());
             } catch (NumberFormatException e) {
                 return 0;
+            }
+        }
+
+        private static int envInt(String name, int fallback) {
+            try {
+                int v = Integer.parseInt(System.getenv().getOrDefault(name, String.valueOf(fallback)).trim());
+                return v > 0 ? v : fallback;
+            } catch (NumberFormatException e) {
+                return fallback;
             }
         }
 
