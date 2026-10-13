@@ -13,8 +13,14 @@ import java.util.Map;
  * server pods (see docs/decisions/003-redis-transfer-state.md).
  *
  *   transfer:<id>      hash: from, to, state, path, pct, reason, created_at, updated_at
+ *                      B3b: + wait_until, wait_reason while state = waiting
+ *                           + retry ("2/3") while state = retrying
  *   transfers:active   sorted set: active ids, score = updated_at (ms)
  *   mesh:changed       pub/sub channel: "<id>" whenever a transfer changes
+ *
+ * States: started -> moving -> done | failed
+ *         B3b: moving -> retrying (peer-app's quick tries) -> waiting
+ *              (sender gone, receiver keeps its chunks) -> moving (resumed)
  *
  * Every change is ONE Lua script, so it is atomic even when several pods
  * write the same transfer at the same moment.
@@ -32,7 +38,7 @@ public class TransferStore {
     /** Result of applying an event. */
     public enum Result {
         IGNORED,    // unknown id, not a participant, already final, or no change
-        CHANGED,    // state updated (path / progress / started)
+        CHANGED,    // state updated (path / progress / retrying / waiting / started)
         DONE,       // this call made it done — count it (exactly once)
         FAILED      // this call made it failed — count it (exactly once)
     }
@@ -57,8 +63,9 @@ public class TransferStore {
             "return 1";
 
     // KEYS[1]=transfer:<id>  KEYS[2]=transfers:active
-    // ARGV: 1 id, 2 event (path|progress|done|failed), 3 path, 4 pct,
-    //       5 reason, 6 finishedTtl, 7 channel, 8 user ('' = server itself)
+    // ARGV: 1 id, 2 event (path|progress|retrying|waiting|done|failed), 3 path, 4 pct,
+    //       5 reason (for retrying: "n/3"), 6 finishedTtl, 7 channel,
+    //       8 user ('' = server itself), 9 waitSecs (only for 'waiting')
     // Returns 0 ignored, 1 changed, 2 became done, 3 became failed.
     private static final String APPLY_SCRIPT =
             NOW_MS +
@@ -80,13 +87,29 @@ public class TransferStore {
             "    publish = false " +
             "  end " +
             "  redis.call('HSET', KEYS[1], 'state', 'moving', 'path', ARGV[3], 'updated_at', now) " +
+            // B3b: moving again after retrying/waiting (same transfer id, resumed).
+            "  redis.call('HDEL', KEYS[1], 'wait_until', 'wait_reason', 'retry') " +
             "elseif ev == 'progress' then " +
             "  redis.call('HSET', KEYS[1], 'state', 'moving', 'pct', ARGV[4], 'updated_at', now) " +
+            "  redis.call('HDEL', KEYS[1], 'wait_until', 'wait_reason', 'retry') " +
+            "elseif ev == 'retrying' then " +
+            // B3b: peer-app's quick tries (sender unreachable). Also keeps
+            // the record alive for the sweeper. wait_until is kept if set.
+            "  redis.call('HSET', KEYS[1], 'state', 'retrying', 'retry', ARGV[5], 'updated_at', now) " +
+            "elseif ev == 'waiting' then " +
+            // B3b: sender gone; receiver keeps its chunks until wait_until.
+            "  local secs = tonumber(ARGV[9]) or 0 " +
+            "  local wu = now + secs * 1000 " +
+            "  redis.call('HSET', KEYS[1], 'state', 'waiting', 'wait_until', wu, " +
+            "    'wait_reason', ARGV[5], 'updated_at', now) " +
+            "  redis.call('HDEL', KEYS[1], 'retry') " +
             "elseif ev == 'done' then " +
             "  redis.call('HSET', KEYS[1], 'state', 'done', 'pct', '100', 'updated_at', now) " +
             "  if ARGV[3] ~= '' then redis.call('HSET', KEYS[1], 'path', ARGV[3]) end " +
+            "  redis.call('HDEL', KEYS[1], 'wait_until', 'wait_reason', 'retry') " +
             "elseif ev == 'failed' then " +
             "  redis.call('HSET', KEYS[1], 'state', 'failed', 'reason', ARGV[5], 'updated_at', now) " +
+            "  redis.call('HDEL', KEYS[1], 'wait_until', 'wait_reason', 'retry') " +
             "else " +
             "  return 0 " +
             "end " +
@@ -99,6 +122,37 @@ public class TransferStore {
             "if publish then redis.call('PUBLISH', ARGV[7], ARGV[1]) end " +
             "if ev == 'done' then return 2 elseif ev == 'failed' then return 3 end " +
             "return 1";
+
+    // B3b: the sweeper's check, done atomically in one script so a transfer
+    // that changes between "find silent ids" and "fail it" is never failed
+    // by mistake.
+    //
+    // KEYS[1]=transfer:<id>  KEYS[2]=transfers:active
+    // ARGV: 1 id, 2 silentMs, 3 waitMarginMs, 4 reason (silent),
+    //       5 reason (waited too long), 6 finishedTtl, 7 channel
+    // Returns 3 if this call failed it, else 0.
+    private static final String SILENT_FAIL_SCRIPT =
+            NOW_MS +
+            "local state = redis.call('HGET', KEYS[1], 'state') " +
+            // Record already gone (expired) or final: just drop the leftover id.
+            "if (not state) or state == 'done' or state == 'failed' then " +
+            "  redis.call('ZREM', KEYS[2], ARGV[1]) " +
+            "  return 0 " +
+            "end " +
+            "local upd = tonumber(redis.call('HGET', KEYS[1], 'updated_at')) or 0 " +
+            "if now - upd < tonumber(ARGV[2]) then return 0 end " +
+            "local reason = ARGV[4] " +
+            "if state == 'waiting' then " +
+            "  local wu = tonumber(redis.call('HGET', KEYS[1], 'wait_until')) or 0 " +
+            "  if now < wu + tonumber(ARGV[3]) then return 0 end " +
+            "  reason = ARGV[5] " +
+            "end " +
+            "redis.call('HSET', KEYS[1], 'state', 'failed', 'reason', reason, 'updated_at', now) " +
+            "redis.call('HDEL', KEYS[1], 'wait_until', 'wait_reason', 'retry') " +
+            "redis.call('ZREM', KEYS[2], ARGV[1]) " +
+            "redis.call('EXPIRE', KEYS[1], ARGV[6]) " +
+            "redis.call('PUBLISH', ARGV[7], ARGV[1]) " +
+            "return 3";
 
     private final JedisPool pool;
 
@@ -125,17 +179,35 @@ public class TransferStore {
      * or "" when the server itself decides (peer left, no response).
      */
     public Result apply(String id, String event, String path, String pct, String reason, String user) {
+        return apply(id, event, path, pct, reason, user, 0);
+    }
+
+    /** B3b: same, with waitSecs for a 'waiting' event (seconds the receiver will wait). */
+    public Result apply(String id, String event, String path, String pct, String reason,
+                        String user, long waitSecs) {
         try (Jedis jedis = pool.getResource()) {
             Object r = jedis.eval(APPLY_SCRIPT,
                     List.of(key(id), ACTIVE_KEY),
                     List.of(id, nz(event), nz(path), nz(pct), nz(reason),
-                            String.valueOf(FINISHED_TTL_SECONDS), CHANGED_CHANNEL, nz(user)));
-            return switch ((int) toLong(r)) {
-                case 1 -> Result.CHANGED;
-                case 2 -> Result.DONE;
-                case 3 -> Result.FAILED;
-                default -> Result.IGNORED;
-            };
+                            String.valueOf(FINISHED_TTL_SECONDS), CHANGED_CHANNEL, nz(user),
+                            String.valueOf(waitSecs)));
+            return toResult(r);
+        }
+    }
+
+    /**
+     * B3b: fails a transfer that has been silent for silentMs — unless it is
+     * waiting for its sender and wait_until + waitMarginMs has not passed.
+     */
+    public Result failIfSilent(String id, long silentMs, long waitMarginMs,
+                               String silentReason, String waitedReason) {
+        try (Jedis jedis = pool.getResource()) {
+            Object r = jedis.eval(SILENT_FAIL_SCRIPT,
+                    List.of(key(id), ACTIVE_KEY),
+                    List.of(id, String.valueOf(silentMs), String.valueOf(waitMarginMs),
+                            nz(silentReason), nz(waitedReason),
+                            String.valueOf(FINISHED_TTL_SECONDS), CHANGED_CHANNEL));
+            return toResult(r);
         }
     }
 
@@ -166,6 +238,15 @@ public class TransferStore {
 
     public void close() {
         pool.close();
+    }
+
+    private static Result toResult(Object r) {
+        return switch ((int) toLong(r)) {
+            case 1 -> Result.CHANGED;
+            case 2 -> Result.DONE;
+            case 3 -> Result.FAILED;
+            default -> Result.IGNORED;
+        };
     }
 
     private static String nz(String s) {

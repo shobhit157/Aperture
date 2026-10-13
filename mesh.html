@@ -8,6 +8,7 @@
   :root {
     --bg: #0f1115; --panel: #171a21; --line: #2a2f3a; --text: #d7dce5; --muted: #8a93a6;
     --direct: #3ecf8e; --relay: #f5a623; --pending: #8a93a6; --failed: #ff5c5c; --node: #4ea1ff;
+    --waiting: #a78bfa; --retrying: #facc15;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text);
@@ -37,6 +38,7 @@
   .t { color: var(--muted); }
   .c-direct { color: var(--direct); } .c-relay { color: var(--relay); }
   .c-failed { color: var(--failed); } .c-pending { color: var(--pending); }
+  .c-waiting { color: var(--waiting); } .c-retrying { color: var(--retrying); }
   svg text { fill: var(--text); font-size: 12px; }
   svg .label { fill: var(--muted); font-size: 11px; }
 </style>
@@ -54,6 +56,8 @@
     <span><i style="border-color:var(--direct)"></i>direct</span>
     <span><i style="border-color:var(--relay);border-top-style:dashed"></i>relay</span>
     <span><i style="border-color:var(--pending);border-top-style:dotted"></i>starting / stalled</span>
+    <span><i style="border-color:var(--retrying);border-top-style:dotted"></i>reconnecting</span>
+    <span><i style="border-color:var(--waiting);border-top-style:dashed"></i>waiting for sender</span>
     <span><i style="border-color:var(--failed)"></i>failed</span>
   </div>
 </header>
@@ -72,8 +76,15 @@
  * Mesh v2 (S5). The server sends:
  *   {"type":"snapshot","transfers":[T, ...]}   on connect and every 10 s (active transfers)
  *   {"type":"update","transfer":T}             when one transfer changes (batched, <= 4/s)
- * T = {id, from, to, state: started|moving|done|failed, path: ""|direct|relay,
- *      pct, reason, age_ms (time since the transfer's last event)}
+ * T = {id, from, to, state: started|moving|retrying|waiting|done|failed, path: ""|direct|relay,
+ *      pct, reason, age_ms (time since the transfer's last event),
+ *      wait_left_ms, wait_reason, retry}
+ * B3b: retrying = the connection to the sender broke and the receiver is
+ * trying again by itself (retry = "n/3"); shown yellow, dotted, "reconnecting n/3".
+ * B3b: waiting = the sender is gone, the receiver keeps its chunks and waits
+ * up to wait_left_ms for it. The line stays (purple, dashed) with the time
+ * left; it turns back to normal when the transfer resumes, or fails (and
+ * vanishes) when the receiver gives up.
  *
  * Everything is keyed by transfer id. Each transfer is its own line, so two
  * transfers between the same users (or opposite directions) are drawn apart.
@@ -130,6 +141,8 @@ function applyUpdate(t, fromSnapshot = false) {
   if (prev && isFinal(prev.state)) return;            // final stays final
   const cur = { ...prev, ...t, seenAt: now - (t.age_ms || 0) };
   if (!prev) cur.firstSeen = now;
+  // B3b: keep the deadline as a local time so the minutes count down by themselves.
+  cur.waitUntil = cur.state === 'waiting' ? now + (t.wait_left_ms || 0) : 0;
   touchNode(cur.from, now); touchNode(cur.to, now);
 
   // Log what changed.
@@ -137,6 +150,14 @@ function applyUpdate(t, fromSnapshot = false) {
     log(cur, cur.path ? `started (${cur.path})` : 'started', cur.path || 'pending');
   } else if (cur.path && cur.path !== prev.path) {
     log(cur, prev.path ? `path ${prev.path} -> ${cur.path}` : `path ${cur.path}`, cur.path);
+  }
+  // B3b: connection lost / sender gone / sender back.
+  if (cur.state === 'retrying' && (!prev || prev.state !== 'retrying')) {
+    log(cur, `reconnecting (at ${cur.pct || 0}%)`, 'retrying');
+  } else if (cur.state === 'waiting' && (!prev || prev.state !== 'waiting')) {
+    log(cur, `waiting for sender (${minutesLeft(cur, now)} min left, ${cur.pct || 0}% kept)`, 'waiting');
+  } else if (prev && (prev.state === 'waiting' || prev.state === 'retrying') && cur.state === 'moving') {
+    log(cur, prev.state === 'waiting' ? `resumed from ${cur.pct || 0}%` : 'reconnected', cur.path || 'direct');
   }
   if (isFinal(cur.state)) {
     cur.finishedAt = now;
@@ -151,7 +172,14 @@ const isFinal = (s) => s === 'done' || s === 'failed';
 function touchNode(name, now) { if (name) nodesLastSeen.set(name, now); }
 
 function isStalled(t, now) {
-  return !isFinal(t.state) && now - t.seenAt > STALLED_AFTER_MS;
+  // B3b: a waiting or retrying transfer is quiet on purpose — not stalled.
+  return !isFinal(t.state) && t.state !== 'waiting' && t.state !== 'retrying'
+    && now - t.seenAt > STALLED_AFTER_MS;
+}
+
+// B3b: whole minutes left before the receiver gives up (0 when about to).
+function minutesLeft(t, now) {
+  return Math.max(0, Math.ceil(((t.waitUntil || 0) - now) / 60000));
 }
 
 // ---------------- drawing ----------------
@@ -165,6 +193,8 @@ function el(name, attrs, parent) {
 
 function colorOf(t, now) {
   if (t.state === 'failed') return 'failed';
+  if (t.state === 'waiting') return 'waiting';
+  if (t.state === 'retrying') return 'retrying';
   if (isStalled(t, now) || !t.path) return 'pending';
   return t.path === 'relay' ? 'relay' : 'direct';
 }
@@ -193,7 +223,7 @@ function render() {
 
   svg.textContent = '';
   const defs = el('defs', {}, svg);
-  for (const c of ['direct', 'relay', 'pending', 'failed']) {
+  for (const c of ['direct', 'relay', 'pending', 'retrying', 'waiting', 'failed']) {
     const m = el('marker', { id: 'arrow-' + c, viewBox: '0 0 10 10', refX: '10', refY: '5',
       markerWidth: '7', markerHeight: '7', orient: 'auto-start-reverse' }, defs);
     el('path', { d: 'M0,0 L10,5 L0,10 z', fill: `var(--${c})` }, m);
@@ -223,7 +253,8 @@ function render() {
       // Stop short of the circles so the arrowhead is visible.
       const sx = a.x + (dx / len) * 22, sy = a.y + (dy / len) * 22;
       const ex = b.x - (dx / len) * 24, ey = b.y - (dy / len) * 24;
-      const dash = c === 'relay' ? '8 5' : c === 'pending' ? '2 5' : '';
+      const dash = c === 'relay' ? '8 5' : c === 'pending' ? '2 5'
+        : c === 'retrying' ? '2 4' : c === 'waiting' ? '4 6' : '';
       const finished = isFinal(t.state);
       el('path', {
         d: `M${sx},${sy} Q${mx},${my} ${ex},${ey}`, fill: 'none',
@@ -233,6 +264,8 @@ function render() {
       }, edges);
       const label = t.state === 'done' ? 'done'
         : t.state === 'failed' ? 'failed'
+        : t.state === 'waiting' ? `waiting · ${minutesLeft(t, now)} min left`
+        : t.state === 'retrying' ? `reconnecting ${t.retry || ''}`.trim()
         : isStalled(t, now) ? 'stalled'
         : t.pct > 0 ? t.pct + '%' : (t.path || 'starting');
       const lt = el('text', { x: mx, y: my - 6, 'text-anchor': 'middle', class: 'label' }, edges);
@@ -274,7 +307,11 @@ function renderSide(now) {
     const right = document.createElement('span');
     const c = colorOf(t, now);
     right.className = 'c-' + c;
-    right.textContent = (isStalled(t, now) ? 'stalled' : (t.path || 'starting')) + (t.pct > 0 ? ` ${t.pct}%` : '');
+    right.textContent = t.state === 'waiting'
+      ? `waiting ${minutesLeft(t, now)} min` + (t.pct > 0 ? ` (${t.pct}% kept)` : '')
+      : t.state === 'retrying'
+      ? `reconnecting ${t.retry || ''}`.trim() + (t.pct > 0 ? ` (${t.pct}%)` : '')
+      : (isStalled(t, now) ? 'stalled' : (t.path || 'starting')) + (t.pct > 0 ? ` ${t.pct}%` : '');
     row.append(left, right); activeEl.appendChild(row);
   }
 }

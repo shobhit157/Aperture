@@ -19,8 +19,20 @@ public class MessageDispatcher {
             case CHAT, JOIN, LEAVE ->
                 chatRoom.broadcast(message, null);
 
-            case FILE_REQUEST ->
-                chatRoom.sendTo(message.getTarget(), message);
+            case FILE_REQUEST -> {
+                // B3a: add the sender's address, so a blobs receiver
+                // knows where to fetch from. Content becomes:
+                // filename|size|id|hash|senderEndpoint|senderRelay
+                String senderEndpoint = chatRoom.getEndpointId(message.getSender());
+                String senderRelayUrl = chatRoom.getRelayUrl(message.getSender());
+                Message withAddress = new Message(
+                        MessageType.FILE_REQUEST,
+                        message.getSender(),
+                        message.getTarget(),
+                        message.getContent() + "|" + senderEndpoint + "|" + senderRelayUrl
+                );
+                chatRoom.sendTo(message.getTarget(), withAddress);
+            }
 
             case FILE_ACCEPT -> {
                 String receiverEndpoint = chatRoom.getEndpointId(message.getSender());
@@ -36,6 +48,15 @@ public class MessageDispatcher {
             }
 
             case FILE_REJECT ->
+                chatRoom.sendTo(message.getTarget(), message);
+
+            // B3a: the sender allowed the receiver; tell the receiver to fetch.
+            case FILE_READY ->
+                chatRoom.sendTo(message.getTarget(), message);
+
+            // B3b: "this transfer is over" — passed to the other side as is
+            // (works across pods: sendTo uses the broker when needed).
+            case TRANSFER_END ->
                 chatRoom.sendTo(message.getTarget(), message);
 
             default -> {
