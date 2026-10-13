@@ -10,10 +10,19 @@ import java.util.concurrent.TimeUnit;
  * Mesh v2 S3: everything the server does with transfer events.
  *
  *  - started:  when the receiver accepts (FILE_ACCEPT)
- *  - events:   TRANSFER_EVENT|id=..|state=..|path=..|pct=..|reason=.. from clients
+ *  - events:   TRANSFER_EVENT|id=..|state=..|path=..|pct=..|reason=..|secs=.. from clients
  *  - peer left: a user who disconnects and does not come back within
- *               PEER_LEFT_GRACE_MS -> their active transfers fail
- *  - backup:    a transfer silent for NO_RESPONSE_MS -> failed
+ *               PEER_LEFT_GRACE_MS -> their transfers as RECEIVER fail.
+ *               B3b: transfers where they are the SENDER are left alone:
+ *               the receiver is the active side and always reports the
+ *               outcome itself (done, waiting, expired, never got ready).
+ *  - retrying:  B3b: the receiver reports each of peer-app's quick tries
+ *               (retry=n/3); the mesh shows "reconnecting n/3". Also keeps
+ *               the record alive for the backup sweeper.
+ *  - waiting:   B3b: the receiver reports "waiting" (sender gone, chunks
+ *               kept) with the seconds it will wait; the mesh shows it.
+ *  - backup:    a transfer silent for NO_RESPONSE_MS -> failed, except a
+ *               waiting one before its wait_until (+ WAIT_MARGIN_MS).
  *  - metrics:   counted only when THIS pod's call made the transfer
  *               done/failed (the Lua script decides), so exactly once
  *               no matter how many pods there are.
@@ -26,6 +35,13 @@ public class TransferTracker {
     // Backup only: peers normally report every outcome themselves.
     private static final long NO_RESPONSE_MS = 120_000;
     private static final long SWEEP_EVERY_MS = 15_000;
+    // B3b: a waiting transfer is failed by the backup only this long after
+    // its wait_until (normally the receiver reports "expired" itself first).
+    private static final long WAIT_MARGIN_MS = 120_000;
+    // B3b: used if a client says "waiting" without secs. Same variable and
+    // default as peer-app's transfer lifetime.
+    private static final long WAIT_FALLBACK_SECS = envLong("PEER_TRANSFER_TTL_SECS", 1800);
+    private static final long MAX_WAIT_SECS = 86_400;
 
     private static final int MAX_ID_LENGTH = 64;
 
@@ -63,15 +79,25 @@ public class TransferTracker {
 
     /**
      * One TRANSFER_EVENT line from a client.
-     * Format: TRANSFER_EVENT|id=<id>|state=<path|progress|done|failed>|path=..|pct=..|reason=..
+     * Format: TRANSFER_EVENT|id=<id>|state=<path|progress|retrying|waiting|done|failed>|path=..|pct=..|reason=..|secs=..|retry=..
      * Fields are key=value, in any order; unknown fields are ignored.
+     * secs:  B3b, only for waiting — how long the receiver will keep waiting.
+     * retry: B3b, only for retrying — which quick try, e.g. "2/3".
      */
     public void onClientEvent(String user, String line) {
         Map<String, String> f = parseFields(line);
         String id = f.get("id");
         String state = f.get("state");
         if (!validId(id) || state == null) return;
-        apply(id, state, f.get("path"), f.get("pct"), f.get("reason"), user);
+        long secs = 0;
+        String reason = f.get("reason");
+        if (state.equals("waiting")) {
+            secs = parseSecs(f.get("secs"));
+            if (secs <= 0) secs = WAIT_FALLBACK_SECS;
+        } else if (state.equals("retrying")) {
+            reason = f.get("retry"); // stored as the "retry" field, e.g. "2/3"
+        }
+        apply(id, state, f.get("path"), f.get("pct"), reason, user, secs);
     }
 
     /** A user's session ended (they were the owner, i.e. really left). */
@@ -83,8 +109,14 @@ public class TransferTracker {
                 }
                 for (String id : store.activeIds()) {
                     Map<String, String> t = store.get(id);
-                    if (user.equals(t.get("from")) || user.equals(t.get("to"))) {
-                        apply(id, "failed", null, null, "peer left (" + user + ")", "");
+                    if (user.equals(t.get("to"))) {
+                        // The receiver is gone: nobody is left to report.
+                        apply(id, "failed", null, null, "peer left (" + user + ")", "", 0);
+                    } else if (user.equals(t.get("from"))) {
+                        // B3b: the sender is gone. The receiver waits for it
+                        // and reports the outcome itself — don't fail here.
+                        System.out.println("[TRANSFER] sender " + user + " left, receiver decides id=" + id
+                                + " state=" + t.get("state"));
                     }
                 }
             } catch (Exception e) {
@@ -98,22 +130,31 @@ public class TransferTracker {
     private void sweepSilent() {
         try {
             for (String id : store.silentIds(NO_RESPONSE_MS)) {
-                apply(id, "failed", null, null, "no response", "");
+                TransferStore.Result r = store.failIfSilent(id, NO_RESPONSE_MS, WAIT_MARGIN_MS,
+                        "no response", "sender did not come back");
+                if (r == TransferStore.Result.FAILED) {
+                    if (prometheus != null) prometheus.recordTransferFailed();
+                    System.out.println("[TRANSFER] failed id=" + id + " (sweeper)");
+                }
             }
         } catch (Exception e) {
             System.out.println("[TRANSFER] sweep failed: " + e.getMessage());
         }
     }
 
-    private void apply(String id, String state, String path, String pct, String reason, String user) {
+    private void apply(String id, String state, String path, String pct, String reason,
+                       String user, long waitSecs) {
         try {
-            TransferStore.Result r = store.apply(id, state, path, pct, reason, user);
+            TransferStore.Result r = store.apply(id, state, path, pct, reason, user, waitSecs);
             if (r == TransferStore.Result.DONE) {
                 if (prometheus != null) prometheus.recordTransferPath(path);
                 System.out.println("[TRANSFER] done id=" + id + " path=" + path);
             } else if (r == TransferStore.Result.FAILED) {
                 if (prometheus != null) prometheus.recordTransferFailed();
                 System.out.println("[TRANSFER] failed id=" + id + " reason=" + reason);
+            } else if (r == TransferStore.Result.CHANGED && state.equals("waiting")) {
+                System.out.println("[TRANSFER] waiting id=" + id + " for " + waitSecs + "s"
+                        + (reason == null || reason.isEmpty() ? "" : " (" + reason + ")"));
             }
         } catch (Exception e) {
             System.out.println("[TRANSFER] apply failed id=" + id + " state=" + state + ": " + e.getMessage());
@@ -140,6 +181,26 @@ public class TransferTracker {
             if (!(Character.isLetterOrDigit(c) || c == '-' || c == '_')) return false;
         }
         return true;
+    }
+
+    // B3b: secs from a client — a number, 0..MAX_WAIT_SECS, else 0.
+    static long parseSecs(String s) {
+        if (s == null) return 0;
+        try {
+            long v = Long.parseLong(s.trim());
+            return (v < 0) ? 0 : Math.min(v, MAX_WAIT_SECS);
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
+    private static long envLong(String name, long fallback) {
+        try {
+            long v = Long.parseLong(System.getenv().getOrDefault(name, String.valueOf(fallback)).trim());
+            return v > 0 ? v : fallback;
+        } catch (NumberFormatException e) {
+            return fallback;
+        }
     }
 
     public void stop() {

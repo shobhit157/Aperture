@@ -54,6 +54,11 @@ public class MessageDispatcher {
             case FILE_READY ->
                 chatRoom.sendTo(message.getTarget(), message);
 
+            // B3b: "this transfer is over" — passed to the other side as is
+            // (works across pods: sendTo uses the broker when needed).
+            case TRANSFER_END ->
+                chatRoom.sendTo(message.getTarget(), message);
+
             default -> {
             }
         }

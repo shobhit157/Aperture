@@ -11,5 +11,8 @@ public enum MessageType {
     FILE_REJECT,
     PEER_INFO,
     FILE_READY,
-    SESSION_ENDED
+    SESSION_ENDED,
+    // B3b: one side tells the other a transfer is over
+    // (content: id|state|reason, state = done; cancelled comes in B4).
+    TRANSFER_END
 }

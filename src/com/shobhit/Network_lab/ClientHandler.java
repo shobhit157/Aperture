@@ -98,6 +98,9 @@ public class ClientHandler implements Runnable {
                 out.println("PEER_INFO|" + message.getContent());
             case FILE_READY ->
                 out.println("FILE_READY|" + message.getSender() + "|" + message.getContent());
+            case TRANSFER_END ->
+                // B3b: TRANSFER_END|<from>|<id>|<state>|<reason>
+                out.println("TRANSFER_END|" + message.getSender() + "|" + message.getContent());
             case REGISTER_ENDPOINT -> {
             }
             case SESSION_ENDED -> {
@@ -391,6 +394,22 @@ public class ClientHandler implements Runnable {
                 String transferId = parts.length > 2 ? parts[2] : "";
                 eventBus.publish(new ChatEvent(
                         new Message(MessageType.FILE_READY, username, targetUser, transferId)
+                ));
+            }
+            case "TRANSFER_END" -> {
+                // B3b: TRANSFER_END|<other user>|<id>|<state>|<reason>
+                // e.g. the receiver tells the sender "done", so the sender
+                // stops serving even if its peer-app never served (the
+                // receiver already had the file).
+                if (parts.length < 4) return;
+                String targetUser = parts[1];
+                String transferId = parts[2];
+                String state = parts[3];
+                String reason = parts.length > 4 ? parts[4] : "";
+                if (!TransferTracker.validId(transferId)) return;
+                eventBus.publish(new ChatEvent(
+                        new Message(MessageType.TRANSFER_END, username, targetUser,
+                                transferId + "|" + state + "|" + reason)
                 ));
             }
             case "FILE_REJECT" -> {

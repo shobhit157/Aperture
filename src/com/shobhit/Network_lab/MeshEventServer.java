@@ -31,9 +31,13 @@ import java.util.concurrent.TimeUnit;
  * JSON sent to mesh.html:
  *   {"type":"snapshot","transfers":[ {...}, ... ]}
  *   {"type":"update","transfer":{...}}
- * where {...} = {"id","from","to","state","path","pct","reason","age_ms"}
- * state: started | moving | done | failed. age_ms = time since the last
- * event, so the page can show "stalled" without the server guessing.
+ * where {...} = {"id","from","to","state","path","pct","reason","age_ms",
+ *                 "wait_left_ms","wait_reason","retry"}
+ * state: started | moving | retrying | waiting | done | failed. age_ms = time since the
+ * last event, so the page can show "stalled" without the server guessing.
+ * B3b: while state = waiting (sender gone, receiver keeps its chunks),
+ * wait_left_ms = how long the receiver will still wait; 0 otherwise.
+ * B3b: while state = retrying (peer-app's quick tries), retry = "n/3".
  */
 public class MeshEventServer extends WebSocketServer {
 
@@ -179,6 +183,9 @@ public class MeshEventServer extends WebSocketServer {
     private static String transferJson(Map<String, String> t, long now) {
         long updated = parseLong(t.get("updated_at"));
         long age = updated > 0 ? Math.max(0, now - updated) : 0;
+        // B3b: time left for a transfer waiting for its sender.
+        long waitUntil = parseLong(t.get("wait_until"));
+        long waitLeft = "waiting".equals(t.get("state")) && waitUntil > 0 ? Math.max(0, waitUntil - now) : 0;
         return "{"
                 + "\"id\":" + str(t.get("id"))
                 + ",\"from\":" + str(t.get("from"))
@@ -188,6 +195,9 @@ public class MeshEventServer extends WebSocketServer {
                 + ",\"pct\":" + parseLong(t.get("pct"))
                 + ",\"reason\":" + str(t.get("reason"))
                 + ",\"age_ms\":" + age
+                + ",\"wait_left_ms\":" + waitLeft
+                + ",\"wait_reason\":" + str(t.get("wait_reason"))
+                + ",\"retry\":" + str(t.get("retry"))
                 + "}";
     }
 

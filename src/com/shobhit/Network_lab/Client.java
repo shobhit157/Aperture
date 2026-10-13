@@ -18,6 +18,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Predicate;
 
 public class Client {
 
@@ -163,7 +164,8 @@ public class Client {
 
         final PrintWriter[] currentOut = new PrintWriter[1];
 
-        transfers.init(currentOut, peerWriter);
+        // B3b: transfers can ask "is this user online?" (for resuming).
+        transfers.init(currentOut, peerWriter, knownUsers::contains);
 
         // Mesh v2 S2: peer-app events go to the transfer manager. Only lines
         // it doesn't handle are printed (startup info, errors).
@@ -330,6 +332,10 @@ public class Client {
                     }
                     knownUsers.clear();
                     knownUsers.addAll(fresh);
+                    // B3b: anyone we were waiting for may be back.
+                    for (String u : fresh) {
+                        transfers.onUserBack(u);
+                    }
                     if (!isBot) {
                         System.out.println("Online now: "
                                 + (fresh.isEmpty() ? "(nobody else)" : String.join(", ", fresh)));
@@ -341,6 +347,10 @@ public class Client {
                     String who = line.substring(4, line.indexOf(" joined the chat"));
                     if (!who.equals(myUsername) && !knownUsers.contains(who)) {
                         knownUsers.add(who);
+                    }
+                    // B3b: "sender back online" — resume waiting fetches from them.
+                    if (!who.equals(myUsername)) {
+                        transfers.onUserBack(who);
                     }
                 } else if (line.startsWith("<<< ") && line.contains(" left the chat")) {
                     String who = line.substring(4, line.indexOf(" left the chat"));
@@ -379,6 +389,14 @@ public class Client {
                 } else if (line.startsWith("FILE_REJECT|")) {
                     String who = line.substring("FILE_REJECT|".length());
                     transfers.onRejected(who);
+
+                } else if (line.startsWith("TRANSFER_END|")) {
+                    // B3b: TRANSFER_END|<from>|<id>|<state>|<reason>
+                    String[] parts = line.split("\\|", 5);
+                    if (parts.length >= 4) {
+                        transfers.onTransferEnd(parts[1], parts[2], parts[3],
+                                parts.length > 4 ? parts[4] : "");
+                    }
 
                 } else if (isBot && line.contains("] !chat ")) {
                     String target = line.substring(line.indexOf("!chat ") + 6).trim();
@@ -505,8 +523,17 @@ public class Client {
     // slot is freed after FILE_READY: from then on its peer-app serves the
     // file by itself, so the sender doesn't need a slot.
     //
+    // B3b: sender gone mid-fetch. peer-app tries 3 times (FETCH_RETRYING,
+    // shown as "reconnecting n/3" on the mesh), then FETCH_WAITING: the partial data is kept and the transfer goes to
+    // phase "waiting" — it gives its receive slot back and the server shows
+    // "waiting for sender". When the sender is online again (JOIN, ONLINE
+    // list, or the ticker noticing) we send `retry <id>`: it continues from
+    // the chunks already on disk. No free slot -> "resume-queued", resumed
+    // before any new request. After the TTL peer-app expires it by itself
+    // (TRANSFER_FAILED).
+    //
     // Events to the server use one message type, with key=value fields:
-    //   TRANSFER_EVENT|id=<id>|state=<path|progress|done|failed>|path=..|pct=..|reason=..
+    //   TRANSFER_EVENT|id=<id>|state=<path|progress|retrying|waiting|done|failed>|path=..|pct=..|reason=..|secs=..|retry=..
     // The server creates the "started" state itself when it sees FILE_ACCEPT.
     // =====================================================================
     static class Transfers {
@@ -522,6 +549,10 @@ public class Client {
         static final long ALLOW_TIMEOUT_MS = 60_000;
         // Progress to the server: receiver side only, at most every 3 s.
         static final long PROGRESS_FORWARD_MS = 3_000;
+        // B3b: a waiting transfer whose sender is online is retried at most
+        // this often by the ticker (in case its JOIN was missed, or the
+        // sender's peer-app wasn't serving yet when we last tried).
+        static final long RESUME_RETRY_MS = 60_000;
 
         // B3a: settings (environment variables).
         static final boolean USE_BLOBS =
@@ -541,6 +572,7 @@ public class Client {
             // send:    queued -> sharing -> requested -> allowing -> serving   (blobs)
             //          queued -> requested -> accepted -> moving               (meta3)
             // receive: queued -> accepted -> fetching / moving
+            //          B3b: moving -> (retrying) -> waiting -> (resume-queued) -> fetching -> moving
             String phase = "queued";
             String hash = "";           // blobs: from SHARED (send) or from the request (receive)
             String senderEndpoint = ""; // receive, blobs: where to fetch from
@@ -550,6 +582,7 @@ public class Client {
             int lastMilestone = 0;
             long lastActivity = System.currentTimeMillis();
             long lastProgressSent = 0;
+            long lastResumeAt = 0;      // B3b: last time we sent `retry` for it
 
             Transfer(String id, Dir dir, String peer, String name, String filePath, long size) {
                 this.id = id;
@@ -574,10 +607,12 @@ public class Client {
 
         private PrintWriter[] currentOut;
         private PrintWriter peerWriter;
+        private Predicate<String> isOnline = u -> false;
 
-        void init(PrintWriter[] currentOut, PrintWriter peerWriter) {
+        void init(PrintWriter[] currentOut, PrintWriter peerWriter, Predicate<String> isOnline) {
             this.currentOut = currentOut;
             this.peerWriter = peerWriter;
+            this.isOnline = isOnline;
             say("[transfers] protocol=" + (USE_BLOBS ? "blobs" : "meta3")
                     + " max_sends=" + MAX_SENDS + " max_receives=" + MAX_RECEIVES);
         }
@@ -705,6 +740,29 @@ public class Client {
             }
         }
 
+        // B3b: TRANSFER_END|<from>|<id>|done|… — the receiver has the file.
+        // Stop serving and finish, whether or not SERVED came (the receiver
+        // may already have had the file, then our peer-app never served).
+        void onTransferEnd(String from, String id, String state, String reason) {
+            if (!state.equals("done")) {
+                say("[transfers] TRANSFER_END " + state + " from " + from + " not handled yet (B4)");
+                return;
+            }
+            synchronized (lock) {
+                Transfer t = byId.get(id);
+                // Already finished (SERVED came first), or unknown to us
+                // (e.g. we restarted: the restored offer expires by itself;
+                // restart cleanup is B3c).
+                if (t == null) return;
+                if (t.dir != Dir.SEND || !t.peer.equals(from)) return; // not ours to end
+                if (t.shared) {
+                    peerWriter.println("unshare " + t.id);
+                    t.shared = false;
+                }
+                finish(t, true, null, false);
+            }
+        }
+
         // EVENT:OFFER_EXPIRED:<id> / EVENT:OFFER_DROPPED:<id>:<reason>
         private void onOfferGone(String id, String reason) {
             synchronized (lock) {
@@ -764,8 +822,101 @@ public class Client {
         // Caller holds lock.
         private void startNextReceive() {
             while (activeReceives.size() < MAX_RECEIVES && !receiveQueue.isEmpty()) {
+                Transfer next = receiveQueue.peekFirst();
+                if (next.phase.equals("resume-queued")) {
+                    // B3b: a resume needs no server connection, only peer-app.
+                    receiveQueue.pollFirst();
+                    resume(next);
+                    continue;
+                }
                 if (out() == null) return;
                 accept(receiveQueue.pollFirst());
+            }
+        }
+
+        // ---------------- B3b: waiting for the sender, resuming ----------------
+
+        // EVENT:FETCH_RETRYING:<id>:<n>:<secs>:<reason> — one of peer-app's 3 quick tries.
+        private void onFetchRetrying(String id, String n, String secs, String reason) {
+            synchronized (lock) {
+                Transfer t = byId.get(id);
+                if (t == null || t.dir != Dir.RECEIVE) return;
+                t.lastActivity = System.currentTimeMillis();
+                say(arrow(t) + "   retrying " + n + "/3 in " + secs + "s (" + shorten(reason) + ")");
+                // Tell the server: the mesh shows "reconnecting n/3" instead
+                // of a line that looks like it is still moving. It also keeps
+                // the record alive (the tries can take longer than the
+                // server's 120 s "no response" backup).
+                sendEvent(t.id, "retrying", "retry=" + n + "/3");
+            }
+        }
+
+        // EVENT:FETCH_WAITING:<id>:<secs_left>:<reason> — tries failed, chunks kept.
+        private void onFetchWaiting(String id, long secsLeft, String reason) {
+            synchronized (lock) {
+                Transfer t = byId.get(id);
+                if (t == null || t.dir != Dir.RECEIVE) return;
+                t.phase = "waiting";
+                t.lastActivity = System.currentTimeMillis();
+                // Give the slot back: other files can be received meanwhile.
+                activeReceives.remove(t);
+                receiveQueue.remove(t);
+                sendEvent(t.id, "waiting", "secs=" + secsLeft, "reason=" + shorten(reason));
+                // Minutes rounded up, the same as the mesh shows.
+                say(arrow(t) + "   waiting for " + t.peer + " (" + ((secsLeft + 59) / 60) + " min left, "
+                        + t.pct + "% kept)");
+                startNextReceive();
+            }
+        }
+
+        /** B3b: a user is online again (JOIN, or in the ONLINE list after our reconnect). */
+        void onUserBack(String who) {
+            synchronized (lock) {
+                for (Transfer t : new ArrayList<>(byId.values())) {
+                    if (t.dir == Dir.RECEIVE && t.peer.equals(who) && t.phase.equals("waiting")) {
+                        say(arrow(t) + "   " + who + " is back");
+                        resumeOrQueue(t);
+                    }
+                }
+            }
+        }
+
+        // Caller holds lock.
+        private void resumeOrQueue(Transfer t) {
+            if (activeReceives.size() < MAX_RECEIVES) {
+                resume(t);
+            } else if (!receiveQueue.contains(t)) {
+                t.phase = "resume-queued";
+                receiveQueue.addFirst(t); // before new requests
+                say(arrow(t) + "   resume queued (receive slots full)");
+            }
+        }
+
+        // Caller holds lock. Takes a slot and asks peer-app to continue.
+        private void resume(Transfer t) {
+            activeReceives.add(t);
+            t.phase = "fetching";
+            long now = System.currentTimeMillis();
+            t.lastResumeAt = now;
+            t.lastActivity = now;
+            peerWriter.println("retry " + t.id);
+            say(arrow(t) + "   resuming");
+        }
+
+        // EVENT:ERROR:retry <id>: <message> — peer-app couldn't start the retry.
+        private void onRetryError(String id, String message) {
+            synchronized (lock) {
+                Transfer t = byId.get(id);
+                if (t == null || t.dir != Dir.RECEIVE) return;
+                if (message.contains("already fetching")) return; // fine, it's running
+                // Nothing to continue right now: back to waiting. If it has
+                // expired, peer-app reports TRANSFER_FAILED by itself.
+                if (t.phase.equals("fetching")) {
+                    activeReceives.remove(t);
+                    t.phase = "waiting";
+                    startNextReceive();
+                }
+                say(arrow(t) + "   retry not started: " + message);
             }
         }
 
@@ -810,6 +961,10 @@ public class Client {
                     if (t != null) {
                         t.path = kv[1];
                         sendEvent(t.id, "done", "path=" + kv[1], "pct=100");
+                        // B3b: tell the sender too. If we already had the file
+                        // its peer-app never serves, so no SERVED would come
+                        // and it would stay in "serving" until the offer expires.
+                        if (t.isBlobs()) sendTransferEnd(t, "done", "");
                         finish(t, true, null, false);
                     }
                 }
@@ -889,11 +1044,41 @@ public class Client {
                 return true;
             }
 
+            // ---- B3b: sender gone, waiting, resuming ----
+            if (line.startsWith("EVENT:FETCH_RETRYING:")) {
+                // EVENT:FETCH_RETRYING:<id>:<n>:<secs>:<reason>   (reason may contain ':')
+                String[] p = line.substring("EVENT:FETCH_RETRYING:".length()).split(":", 4);
+                if (p.length >= 3) onFetchRetrying(p[0], p[1], p[2], p.length > 3 ? p[3] : "");
+                return true;
+            }
+            if (line.startsWith("EVENT:FETCH_WAITING:")) {
+                // EVENT:FETCH_WAITING:<id>:<secs_left>:<reason>
+                String[] p = line.substring("EVENT:FETCH_WAITING:".length()).split(":", 3);
+                if (p.length >= 2) onFetchWaiting(p[0], parseLong(p[1]), p.length > 2 ? p[2] : "");
+                return true;
+            }
+            if (line.startsWith("EVENT:RETRY:")) {
+                // peer-app started our `retry` — RESUMED / progress follow.
+                return true;
+            }
+            if (line.startsWith("EVENT:ERROR:retry ")) {
+                // EVENT:ERROR:retry <id>: <message>
+                String[] kv = idAndRest(line, "EVENT:ERROR:retry ");
+                onRetryError(kv[0], kv[1].trim());
+                return true;
+            }
+
             // Quiet events: useful in logs, too noisy for the screen.
+            // FETCH_EXPIRED is always followed by TRANSFER_FAILED (handled above).
             return line.startsWith("EVENT:FILE_HASH:")
                     || line.startsWith("EVENT:TRANSFER_TIMING:")
                     || line.startsWith("EVENT:SHARE_TIMING:")
-                    || line.startsWith("EVENT:UNSHARED:");
+                    || line.startsWith("EVENT:UNSHARED:")
+                    || line.startsWith("EVENT:RETRY_ALL:")
+                    || line.startsWith("EVENT:FETCH_EXPIRED:")
+                    // B3b: SERVED and TRANSFER_END both unshare; the second
+                    // one finds no offer. Harmless, so not shown.
+                    || line.startsWith("EVENT:ERROR:unshare: no offer");
         }
 
         private void onProgress(String id, int pct) {
@@ -925,6 +1110,10 @@ public class Client {
                 Transfer t = byId.get(id);
                 if (t == null) return;
                 t.lastActivity = System.currentTimeMillis();
+                // B3b: peer-app repeats the path on every retry ("direct ->
+                // direct"). Only a real change is shown and sent: a repeat
+                // would turn the server's "retrying" back into "moving".
+                if (path.equals(t.path)) return;
                 if (t.phase.equals("accepted") || t.phase.equals("fetching")) t.phase = "moving";
                 String before = t.path;
                 t.path = path;
@@ -1010,6 +1199,14 @@ public class Client {
                         }
                     }
                 }
+                // B3b: a waiting transfer whose sender is online (JOIN missed,
+                // or its peer-app wasn't serving yet): try again, not too often.
+                for (Transfer t : new ArrayList<>(byId.values())) {
+                    if (t.dir == Dir.RECEIVE && t.phase.equals("waiting")
+                            && now - t.lastResumeAt > RESUME_RETRY_MS && isOnline.test(t.peer)) {
+                        resumeOrQueue(t);
+                    }
+                }
                 // After a reconnect, start anything that waited for a connection.
                 startNextSend();
                 startNextReceive();
@@ -1040,7 +1237,13 @@ public class Client {
                     sb.append("      ").append(describe(t)).append("\n");
                 }
                 for (Transfer t : receiveQueue) {
-                    sb.append("      waiting: ").append(t.name).append(" <- ").append(t.peer).append("\n");
+                    sb.append("      ").append(t.phase.equals("resume-queued") ? "resume queued: " : "waiting: ")
+                      .append(t.name).append(" <- ").append(t.peer).append("\n");
+                }
+                for (Transfer t : byId.values()) {
+                    if (t.dir == Dir.RECEIVE && t.phase.equals("waiting")) {
+                        sb.append("      waiting for sender: ").append(describe(t)).append("\n");
+                    }
                 }
                 System.out.print(sb);
             }
@@ -1071,6 +1274,14 @@ public class Client {
             out.println(sb);
         }
 
+        // B3b: TRANSFER_END|<other user>|<id>|<state>|<reason> to the server.
+        private void sendTransferEnd(Transfer t, String state, String reason) {
+            PrintWriter out = out();
+            if (out == null) return;
+            out.println("TRANSFER_END|" + t.peer + "|" + t.id + "|" + state + "|"
+                    + (reason == null ? "" : reason.replace('|', ' ').replace('\n', ' ')));
+        }
+
         private static String arrow(Transfer t) {
             return t.dir == Dir.SEND
                     ? "[send] " + t.name + " -> " + t.peer
@@ -1087,6 +1298,13 @@ public class Client {
             return sep >= 0
                     ? new String[] { rest.substring(0, sep), rest.substring(sep + 1) }
                     : new String[] { rest, "" };
+        }
+
+        // B3b: keep peer-app reasons short on screen and in events.
+        private static String shorten(String s) {
+            if (s == null) return "";
+            s = s.trim();
+            return s.length() > 120 ? s.substring(0, 117) + "..." : s;
         }
 
         private static int parseInt(String s) {
