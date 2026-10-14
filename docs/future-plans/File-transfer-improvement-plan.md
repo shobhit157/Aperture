@@ -1,6 +1,6 @@
 # File Transfer Improvement Plan
 
-Status: **Phase A ✅ done · Mesh v2 ✅ done · Phase B 🔄 B1 spike done, B0 next.**
+Status: **Phase A ✅ done · Mesh v2 ✅ done · Phase B 🔄 B0, B1, B2, B3a, B3b done · B3c next.**
 
 Fix the bugs in the current transfer protocol, then move to `iroh-blobs` for content-addressed, verified, resumable transfers. Bugs referenced by number are in [`docs/problems/File-transfer-bugs.md`](../problems/File-transfer-bugs.md).
 
@@ -106,7 +106,7 @@ Each side writes **its half** of the transfer to its data folder. The **receiver
 
 - **Expiry:** both lists expire (e.g. 30 min); expired entries are deleted.
 - **Retry:** the receiver retries with growing waits (5 s, 10 s, 20 s …) until expiry.
-- **Mesh:** while the receiver retries, the transfer shows **waiting for sender**, not "moving" or "failed". It becomes failed only when the receiver gives up.
+- **Mesh (as built in B3b):** during the quick tries the transfer shows **reconnecting n/3**; after them **waiting for sender · N min left**, never "moving" or "failed". It becomes failed only when the receiver gives up (TTL). When the sender is back the same transfer ID continues ("resumed from X%").
 - **Cleanup:** on done or expiry both sides delete their entry; the sender may drop the blob from its store.
 
 **Bots:** survive a container crash with an `emptyDir` volume; survive pod deletion only with a **persistent volume per bot**. That means a StatefulSet (`bot-0`, `bot-1`, …), each with its own disk holding key, store and lists.
@@ -118,7 +118,7 @@ Each side writes **its half** of the transfer to its data folder. The **receiver
 | B1 | ✅ Spike: share, fetch, resume, path, allow-list, speed | [Results](../Experiments/iroh-blobs-phase-b1-spike.md) |
 | **B0** | **Persistent identity + `Router`**: key file in the data folder; one endpoint serves META3 now and blobs next | Same endpoint ID after restart; META3 transfers unchanged |
 | B2 | **peer-app commands**: `share`, `allow`, `fetch` + events; outgoing offers and pending fetches saved and reloaded; clean shutdown on SIGTERM and Ctrl+C | Test script: share → allow → fetch between two peer-apps; restart either side mid-fetch → it completes |
-| B3 | **Java flow**: hash in the offer, allow on `PEER_INFO`, receiver fetches and retries; mesh "waiting for sender" state | admin ↔ admin2 and admin ↔ bot via blobs; mesh correct; Grafana counts once |
+| B3 | ✅ **B3a + B3b** (PR #5) **Java flow**: hash in the offer, allow on `PEER_INFO`, receiver fetches; `retrying` → `waiting for sender` → resume when the sender is back; same-file fix (`TRANSFER_END`) · ⏳ **B3c** restart cleanup, **B3d** small fixes | ✅ admin ↔ admin2 via blobs, incl. resume across two server pods · admin ↔ bot in B4 |
 | B4 | **Tests + bots as StatefulSet with volumes**: kill receiver / sender / both mid-transfer; change the file while the sender is down; wrong peer rejected; Phase A checks; speed table blobs vs META3; 20-bot scale test (also covers the pending Mesh v2 tests) | All pass; evidence saved |
 | B5 | **Remove META3** | Only the blobs path left |
 
@@ -129,7 +129,7 @@ Each side writes **its half** of the transfer to its data folder. The **receiver
 | Receiver keeps the blob after export? | Delete (saves disk) / keep for a while to serve others (swarm start) | B2 |
 | Data folder location | Next to peer-app / a fixed folder per user | B0 |
 | How long the sender serves after a failure | 10 / 30 / 60 min | B2 |
-| How the mesh links a resumed attempt to the first one | Same transfer ID with a "resumed" event / new ID linked by hash | B3 |
+| How the mesh links a resumed attempt to the first one | ✅ **Same transfer ID**: `moving → retrying → waiting → moving` (log: "resumed from X%") | B3 |
 
 ---
 
@@ -169,7 +169,7 @@ Each side writes **its half** of the transfer to its data folder. The **receiver
 | Resume after a clean stop | B1 ✅ | Only missing chunks fetched; hash matches |
 | Wrong peer | B1 ✅ | Rejected, 0 bytes |
 | Receiver killed mid-transfer | B4 | Resumes after restart |
-| Sender killed mid-transfer | B4 | Receiver retries, completes after sender returns |
+| Sender killed mid-transfer | B3 ✅ (admin ↔ admin2) · B4 bots | Receiver retries, completes after sender returns |
 | Both killed | B4 | Completes after both return |
 | File changed while sender down | B4 | Clear failure, never a wrong file |
 | 20 bots, `!send all all small` | B4 | All complete, hashes match, Grafana exact |
