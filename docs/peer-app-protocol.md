@@ -2,7 +2,7 @@
 
 > How Aperture's peer-app talks — to the Java client, and to other peer-apps —
 > and how it got this shape. Current versions: **META3** (Phase A4, still used by Java)
-> and **iroh-blobs** (Phase B2, peer-app ready; Java switches in B3).
+> and **iroh-blobs** (Phase B2; used by Java since B3a, default `TRANSFER_PROTOCOL=blobs`).
 
 ## The big picture
 
