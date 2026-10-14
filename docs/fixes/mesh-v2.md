@@ -1,6 +1,6 @@
 # Mesh v2: Live Transfer Tracking + Client Limits
 
-**Status: Done.** Built in steps S1–S6, merged to `main` in PR #2.
+**Status: Done.** Built in steps S1–S6, merged to `main` in PR #2. Extended in B3b (PR #5): `retrying` / `waiting` states, see [Changed in B3b](#changed-in-b3b-iroh-blobs-resume).
 Scale tests (20 bots, 3 pods) are still pending; see [Tests](#tests).
 Related: [decision 006: transfer state in Redis](../../decisions/006-transfer-state-in-redis.md), [mesh evolution plan](../../future-plans/mesh-evolution-plan.md).
 
@@ -124,12 +124,14 @@ TRANSFER_EVENT|id=<id>|state=<state>|path=<path>|pct=<0-100>|reason=<text>
 | `progress` | pct | receiver only, at most every 3 s |
 | `done` | path | receiver |
 | `failed` | reason | whichever side knows |
+| `retrying` | retry = `n/3` | receiver (B3b) |
+| `waiting` | secs (time left), reason | receiver (B3b) |
 
 ### Redis keys
 
 | Key | Holds |
 |---|---|
-| `transfer:<id>` (hash) | id, from, to, state, path, pct, reason, created_at, updated_at |
+| `transfer:<id>` (hash) | id, from, to, state, path, pct, reason, created_at, updated_at; B3b: `retry`, `wait_until`, `wait_reason` |
 | `transfers:active` (sorted set) | active IDs, scored by `updated_at` (ms, Redis clock) |
 | `mesh:changed` (pub/sub channel) | "this ID changed" pings |
 
@@ -143,6 +145,11 @@ stateDiagram-v2
   started --> moving: path / progress
   moving --> moving: path change (relay ↔ direct), progress
   moving --> done: done (receiver)
+  moving --> retrying: connection to sender lost (B3b)
+  retrying --> moving: a quick try works
+  retrying --> waiting: 3 tries failed (B3b)
+  waiting --> moving: sender back, resumed
+  waiting --> failed: TTL reached (expired)
   started --> failed: failed / peer left / no response
   moving --> failed: failed / peer left / no response
   done --> [*]: record expires after 30 s
@@ -166,9 +173,9 @@ stateDiagram-v2
 - **Only the two participants** (`from` / `to`) can change a transfer.
 - `done` and `failed` are **final**, checked inside one atomic Redis step (Lua), so this holds even when several pods write at once.
 - **Counted once:** the Lua script returns *ignored / changed / became done / became failed*, and only the pod whose call made it final increments the counter (`chat_file_transfers_direct_total` / `_relay_total` / `_failed_total`).
-- **Peer left:** when a user disconnects, the server waits **30 s** (short reconnects are common). If the user isn't back online, their active transfers are marked failed ("peer left").
-- **Backup:** no event for **120 s** → failed ("no response"). Every pod checks every 15 s; the atomic step makes sure it happens only once.
-- The mesh shows **stalled** (visual only) after 20 s of silence, keeping the last known path colour. The server sends `age_ms` so the page doesn't guess.
+- **Peer left:** when a user disconnects, the server waits **30 s** (short reconnects are common). If the user isn't back online, their transfers **as receiver** are marked failed ("peer left"). *(B3b: when the **sender** leaves, the receiver decides: done / waiting / expired.)*
+- **Backup:** no event for **120 s** → failed ("no response"). Every pod checks every 15 s; the atomic step makes sure it happens only once. *(B3b: a `waiting` transfer is skipped until `wait_until` + 2 min; check and fail are one Lua step.)*
+- The mesh shows **stalled** (visual only) after 20 s of silence, keeping the last known path colour. The server sends `age_ms` so the page doesn't guess. `retrying` and `waiting` are never shown as stalled.
 
 ### How "counted once" works with two reporters
 
@@ -184,6 +191,8 @@ sequenceDiagram
 ```
 
 ## Client limits (1 + 1)
+
+> B3a: now configurable with `MAX_SENDS` / `MAX_RECEIVES` (default **2 + 2**). A blobs sender's slot is freed after `FILE_READY`; a `waiting` receive gives its slot back.
 
 ```mermaid
 flowchart LR
@@ -244,3 +253,40 @@ flowchart LR
 - Swarm: a transfer with several legs (one per provider) and `providers:<hash>` in Redis, with Phase B.
 - Redis Streams for an event log / replay.
 - Mesh at larger scale: see the [mesh evolution plan](../../future-plans/mesh-evolution-plan.md).
+
+---
+
+## Changed in B3b (iroh-blobs resume)
+
+With iroh-blobs the receiver keeps its chunks when the sender drops, so a gone sender is no longer the end of a transfer.
+
+| state | Mesh |
+|---|---|
+| `retrying` | yellow dotted, "reconnecting n/3" (peer-app's quick tries, 5 / 10 / 20 s) |
+| `waiting` | purple dashed, "waiting · N min left"; the minutes count down in the page |
+
+```mermaid
+sequenceDiagram
+  participant S as Sender
+  participant RC as Receiver
+  participant P as Server pods
+  participant M as Mesh
+  Note over S: Ctrl+C / crash at 40%
+  RC->>P: TRANSFER_EVENT retrying retry=1/3 … 3/3
+  P-->>M: reconnecting
+  RC->>P: TRANSFER_EVENT waiting secs=1750
+  P-->>M: waiting · 30 min left
+  S->>P: joins again
+  P-->>RC: ">>> sender joined the chat"
+  RC->>RC: retry <id> (continues from 40%)
+  RC->>P: progress / path → moving
+  P-->>M: resumed from 40%
+  RC->>P: done
+  RC->>P: TRANSFER_END|sender|id|done
+  P-->>S: TRANSFER_END → unshare, done OK
+```
+
+- **`TRANSFER_END|<user>|<id>|done|`** (new routed message, receiver → sender): the sender stops serving even if its peer-app never served (the receiver already had the file). Before B3b the sender stayed in `serving` until the offer expired.
+- Leftover IDs whose record already expired are removed from `transfers:active` by the sweeper.
+- Tested (admin ↔ admin2): resume from 71 % / 58 %, expiry with a 120 s TTL, resume with the two clients on **different server pods**.
+- Known: the mesh's "% kept" can lag behind (progress is forwarded every 3 s) → fixed in B3d.
