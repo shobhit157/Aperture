@@ -16,6 +16,12 @@
 //!   cancel <id>             -> stop and delete the partial data
 //! Every share and fetch lives PEER_TRANSFER_TTL_SECS (default 30 min) from
 //! when it was created; then it expires and is cleaned up.
+//!
+//! B3c: after a restart a saved fetch is NOT started by itself. peer-app
+//! only reports it (RESTORED_FETCH) and waits: Java first checks with the
+//! server, then sends `retry <id>` (go) or `cancel <id>` (delete). Saved
+//! offers come back as before (the sender only answers requests) and are
+//! reported too (RESTORED_OFFER), so Java knows them.
 
 use anyhow::{anyhow, Result};
 use iroh::{
@@ -145,6 +151,63 @@ impl FetchRequest {
     }
 }
 
+/// B3c: one offer brought back at startup (reported to Java).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoredOffer {
+    pub transfer_id: String,
+    pub hash: String,
+    pub size: u64,
+    pub name: String,
+}
+
+impl RestoredOffer {
+    /// `EVENT:RESTORED_OFFER:<id>:<hash>:<size>:<name>` (name last: it may
+    /// contain ':').
+    pub fn event_line(&self) -> String {
+        format!(
+            "EVENT:RESTORED_OFFER:{}:{}:{}:{}",
+            self.transfer_id,
+            self.hash,
+            self.size,
+            clean(&self.name)
+        )
+    }
+}
+
+/// B3c: one unfinished fetch found at startup. Not started: it waits for
+/// `retry` (or `cancel`) from Java.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoredFetch {
+    pub transfer_id: String,
+    pub hash: String,
+    pub size: u64,
+    /// Verified bytes already in the store (what a retry continues from).
+    pub bytes_on_disk: u64,
+    pub name: String,
+}
+
+impl RestoredFetch {
+    /// `EVENT:RESTORED_FETCH:<id>:<hash>:<size>:<bytes_on_disk>:<name>`
+    /// (name last: it may contain ':').
+    pub fn event_line(&self) -> String {
+        format!(
+            "EVENT:RESTORED_FETCH:{}:{}:{}:{}:{}",
+            self.transfer_id,
+            self.hash,
+            self.size,
+            self.bytes_on_disk,
+            clean(&self.name)
+        )
+    }
+}
+
+/// File name only (no folders) for a restored offer's line.
+fn display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 #[derive(Clone)]
 pub struct Blobs {
     store: FsStore,
@@ -235,8 +298,9 @@ impl Blobs {
     /// Sender side, at startup: bring saved offers back. An offer whose file
     /// changed or disappeared while peer-app was off is dropped. Expired
     /// offers are skipped (the expiry check removes them a moment later).
-    pub async fn restore_offers(&self) -> usize {
-        let mut restored = 0;
+    /// B3c: returns what came back, so main can report each one to Java.
+    pub async fn restore_offers(&self) -> Vec<RestoredOffer> {
+        let mut restored = Vec::new();
         for (id, rec) in self.state.offers() {
             if expired_now(rec.created_ms) {
                 continue;
@@ -246,7 +310,12 @@ impl Blobs {
                     let allowed: HashSet<EndpointId> =
                         rec.allowed.iter().filter_map(|p| p.parse::<EndpointId>().ok()).collect();
                     self.access.lock().unwrap().offers.insert(id.clone(), Offer { hash, allowed });
-                    restored += 1;
+                    restored.push(RestoredOffer {
+                        transfer_id: id.clone(),
+                        hash: hash.to_string(),
+                        size: rec.size,
+                        name: display_name(&rec.path),
+                    });
                 }
                 Err(reason) => {
                     println!("EVENT:OFFER_DROPPED:{id}:{}", clean(&reason));
@@ -303,18 +372,28 @@ impl Blobs {
         Ok(hash)
     }
 
-    /// Receiver side, at startup: continue every saved, unfinished fetch.
-    /// Expired ones are skipped (the expiry check removes them).
-    pub fn restore_fetches(&self) -> usize {
-        let mut restored = 0;
+    /// Receiver side, at startup: find every saved, unfinished fetch.
+    /// B3c: they are NOT started here. Each one is reported (with the bytes
+    /// already on disk) and waits for `retry <id>` (go) or `cancel <id>`
+    /// (delete) from Java, which first checks with the server. If nobody
+    /// answers, it expires with the normal TTL. Expired ones are skipped
+    /// (the expiry check removes them).
+    pub async fn restore_fetches(&self) -> Vec<RestoredFetch> {
+        let mut restored = Vec::new();
         for (id, rec) in self.state.fetches() {
             if expired_now(rec.created_ms) {
                 continue;
             }
             match FetchRequest::from_record(&id, &rec) {
                 Ok(req) => {
-                    self.fetch(req);
-                    restored += 1;
+                    let bytes_on_disk = self.bytes_on_disk(req.hash, req.size).await;
+                    restored.push(RestoredFetch {
+                        transfer_id: id.clone(),
+                        hash: rec.hash.clone(),
+                        size: rec.size,
+                        bytes_on_disk,
+                        name: rec.name.clone(),
+                    });
                 }
                 Err(reason) => {
                     println!("EVENT:ERROR:fetch {id}: saved fetch dropped: {}", clean(&reason));
@@ -325,6 +404,21 @@ impl Blobs {
             }
         }
         restored
+    }
+
+    /// Verified bytes of this blob already in the store (0 if none).
+    async fn bytes_on_disk(&self, hash: Hash, size: u64) -> u64 {
+        if let Ok(BlobStatus::Complete { size: s }) = self.store.blobs().status(hash).await {
+            if s == size {
+                return size;
+            }
+        }
+        self.store
+            .remote()
+            .local(hash)
+            .await
+            .map(|info| info.local_bytes())
+            .unwrap_or(0)
     }
 
     // -------------------------------------------------------- expiry (B2b-2)
@@ -571,8 +665,8 @@ impl Blobs {
                     }
                 }
                 Err(_) if this.stopping.load(Ordering::SeqCst) => {
-                    // Interrupted by shutdown: kept, resumes on restart.
-                    println!("EVENT:FETCH_PAUSED:{id}:peer-app is stopping, resumes on restart");
+                    // Interrupted by shutdown: kept; after a restart it waits for `retry` (B3c).
+                    println!("EVENT:FETCH_PAUSED:{id}:peer-app is stopping, kept (continues after restart when Java says retry)");
                 }
                 Err(reason) => this.wait_or_expire(&id, &reason).await,
             }
@@ -1013,6 +1107,39 @@ mod tests {
         assert!(FetchRequest::from_record("t1", &bad_sender).is_err());
 
         assert!(FetchRequest::from_record("../x", &good).is_err());
+    }
+
+    #[test]
+    fn restored_lines_keep_the_name_last() {
+        let h = Hash::new(b"x").to_string();
+        let o = RestoredOffer { transfer_id: "t1".into(), hash: h.clone(), size: 300, name: "a:b c.mp4".into() };
+        assert_eq!(o.event_line(), format!("EVENT:RESTORED_OFFER:t1:{h}:300:a:b c.mp4"));
+
+        let f = RestoredFetch {
+            transfer_id: "t2".into(),
+            hash: h.clone(),
+            size: 300,
+            bytes_on_disk: 120,
+            name: "holiday.mp4".into(),
+        };
+        assert_eq!(f.event_line(), format!("EVENT:RESTORED_FETCH:t2:{h}:300:120:holiday.mp4"));
+
+        // Java splits on ':' with a limit, so the first fields must be fixed.
+        let line = f.event_line();
+        let fields: Vec<&str> = line.trim_start_matches("EVENT:RESTORED_FETCH:").splitn(5, ':').collect();
+        assert_eq!(fields, vec!["t2", h.as_str(), "300", "120", "holiday.mp4"]);
+    }
+
+    #[test]
+    fn restored_name_has_no_newline() {
+        let o = RestoredOffer { transfer_id: "t1".into(), hash: "h".into(), size: 1, name: "bad\nname".into() };
+        assert!(!o.event_line().contains('\n'));
+    }
+
+    #[test]
+    fn display_name_is_file_name_only() {
+        assert_eq!(display_name(Path::new("/home/u/files/case1.bin")), "case1.bin");
+        assert_eq!(display_name(Path::new("case1.bin")), "case1.bin");
     }
 
     #[test]
