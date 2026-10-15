@@ -1,6 +1,6 @@
 # Restart Sync: Findings (before B3c)
 
-**Status:** Found 15 Oct 2026 on `main` (c51a00e, B3b) · fix: [B3c restart sync](../fixes/b3c-restart-sync.md)
+**Status:** Found 15 Oct 2026 on `main` (c51a00e, B3b) · fix: [B3c restart sync](../fixes/PhaseB3c-restart-sync-paln.md)
 Related: [File transfer bugs](File-transfer-bugs.md) · [Mesh v2](../fixes/mesh-v2.md) · [peer-app protocol](../peer-app-protocol.md)
 
 ---
