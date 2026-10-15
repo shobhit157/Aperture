@@ -57,7 +57,7 @@
     <span><i style="border-color:var(--relay);border-top-style:dashed"></i>relay</span>
     <span><i style="border-color:var(--pending);border-top-style:dotted"></i>starting / stalled</span>
     <span><i style="border-color:var(--retrying);border-top-style:dotted"></i>reconnecting</span>
-    <span><i style="border-color:var(--waiting);border-top-style:dashed"></i>waiting for sender</span>
+    <span><i style="border-color:var(--waiting);border-top-style:dashed"></i>waiting (for sender / receiver)</span>
     <span><i style="border-color:var(--failed)"></i>failed</span>
   </div>
 </header>
@@ -78,13 +78,16 @@
  *   {"type":"update","transfer":T}             when one transfer changes (batched, <= 4/s)
  * T = {id, from, to, state: started|moving|retrying|waiting|done|failed, path: ""|direct|relay,
  *      pct, reason, age_ms (time since the transfer's last event),
- *      wait_left_ms, wait_reason, retry}
+ *      wait_left_ms, wait_reason, retry, wait_for}
  * B3b: retrying = the connection to the sender broke and the receiver is
  * trying again by itself (retry = "n/3"); shown yellow, dotted, "reconnecting n/3".
  * B3b: waiting = the sender is gone, the receiver keeps its chunks and waits
  * up to wait_left_ms for it. The line stays (purple, dashed) with the time
  * left; it turns back to normal when the transfer resumes, or fails (and
  * vanishes) when the receiver gives up.
+ * B3c: wait_for = "sender" | "receiver" says who is being waited for. A
+ * receiver that went offline (or restarted) is waited for the same way:
+ * "waiting for receiver", until the transfer's 30 min are up.
  *
  * Everything is keyed by transfer id. Each transfer is its own line, so two
  * transfers between the same users (or opposite directions) are drawn apart.
@@ -135,6 +138,11 @@ function applySnapshot(list) {
   render();
 }
 
+// B3c: who a waiting transfer waits for (old servers send no wait_for: sender).
+function waitWho(t) {
+  return t.wait_for === 'receiver' ? 'receiver' : 'sender';
+}
+
 function applyUpdate(t, fromSnapshot = false) {
   const now = Date.now();
   const prev = transfers.get(t.id);
@@ -154,8 +162,8 @@ function applyUpdate(t, fromSnapshot = false) {
   // B3b: connection lost / sender gone / sender back.
   if (cur.state === 'retrying' && (!prev || prev.state !== 'retrying')) {
     log(cur, `reconnecting (at ${cur.pct || 0}%)`, 'retrying');
-  } else if (cur.state === 'waiting' && (!prev || prev.state !== 'waiting')) {
-    log(cur, `waiting for sender (${minutesLeft(cur, now)} min left, ${cur.pct || 0}% kept)`, 'waiting');
+  } else if (cur.state === 'waiting' && (!prev || prev.state !== 'waiting' || prev.wait_for !== cur.wait_for)) {
+    log(cur, `waiting for ${waitWho(cur)} (${minutesLeft(cur, now)} min left, ${cur.pct || 0}% kept)`, 'waiting');
   } else if (prev && (prev.state === 'waiting' || prev.state === 'retrying') && cur.state === 'moving') {
     log(cur, prev.state === 'waiting' ? `resumed from ${cur.pct || 0}%` : 'reconnected', cur.path || 'direct');
   }
@@ -264,7 +272,7 @@ function render() {
       }, edges);
       const label = t.state === 'done' ? 'done'
         : t.state === 'failed' ? 'failed'
-        : t.state === 'waiting' ? `waiting · ${minutesLeft(t, now)} min left`
+        : t.state === 'waiting' ? `waiting for ${waitWho(t)} · ${minutesLeft(t, now)} min left`
         : t.state === 'retrying' ? `reconnecting ${t.retry || ''}`.trim()
         : isStalled(t, now) ? 'stalled'
         : t.pct > 0 ? t.pct + '%' : (t.path || 'starting');
@@ -308,7 +316,7 @@ function renderSide(now) {
     const c = colorOf(t, now);
     right.className = 'c-' + c;
     right.textContent = t.state === 'waiting'
-      ? `waiting ${minutesLeft(t, now)} min` + (t.pct > 0 ? ` (${t.pct}% kept)` : '')
+      ? `waiting for ${waitWho(t)} ${minutesLeft(t, now)} min` + (t.pct > 0 ? ` (${t.pct}% kept)` : '')
       : t.state === 'retrying'
       ? `reconnecting ${t.retry || ''}`.trim() + (t.pct > 0 ? ` (${t.pct}%)` : '')
       : (isStalled(t, now) ? 'stalled' : (t.path || 'starting')) + (t.pct > 0 ? ` ${t.pct}%` : '');
