@@ -119,6 +119,19 @@ Server and peer-app read the same `PEER_TRANSFER_TTL_SECS` (default 1800 s).
 - **Sender back, receiver tries too early:** a locked offer refuses the fetch; the receiver's next quick try (5–10 s) works. No extra code.
 - **TTL counts from the transfer start**, not from each disconnect, so a transfer can't live forever.
 
+## 3.7 Edge cases
+
+| # | Case | Rule |
+|---|---|---|
+| E1 | Reconnect without restart (Java and peer-app kept running) | Compare only IDs Java doesn't already know; the next progress moves waiting → moving |
+| E2 | Restart before the transfer began (state `started`, no fetch / offer yet) | Report failed "restarted before the transfer began", not "lost local data" |
+| E3 | Server not reachable at startup | Print "restored N transfers · waiting for server"; compare when connected; TTL is the safety net |
+| E4 | Redis lost its data | `MY_TRANSFERS` empty → restored items deleted; check Redis persistence (AOF); accepted for now |
+| E5 | Double retry (B3b "sender back" + B3c "go") | `already fetching` = OK, not shown |
+| E6 | Laptop clock differs from Redis clock | 2 min margin; server state wins |
+| E7 | Bots on the old build | Rebuild client image with the server (`:b3c`); test in B4 |
+| E8 | Same user started twice | Blob store lock + "superseded" already stop it; keep as a test |
+
 ---
 
 ## 4. Changes
