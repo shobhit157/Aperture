@@ -122,61 +122,12 @@ Each side writes **its half** of the transfer to its data folder. The **receiver
 | B4 | **Tests + bots as StatefulSet with volumes**: kill receiver / sender / both mid-transfer; change the file while the sender is down; wrong peer rejected; Phase A checks; speed table blobs vs META3; 20-bot scale test (also covers the pending Mesh v2 tests) | All pass; evidence saved |
 | B5 | **Remove META3** | Only the blobs path left |
 
-### B3c plan: agree after a restart (design, not built yet)
+### B3c: agree after a restart
 
-**Problem.** After a restart, peer-app reloads its saved work (`offers.json`, `fetches.json`), but the Java client starts with an empty list (`byId` is memory only). The same endpoint ID only means the same *name on the network*; it doesn't bring back Java's list.
+After a restart peer-app remembers its transfers but the Java client forgets them, and the server gives a receiver only 30 s. Fix: the receiver's restored download waits for Java; the server sends `MY_TRANSFERS` on login; Java compares both lists (go / delete / report failed); a receiver that leaves gets 30 min like a sender.
 
-Seen in testing: sender closed mid-transfer and opened again → the transfer resumed and finished on the receiver and the mesh, but the **sender terminal printed nothing** (`SERVED` and `TRANSFER_END` had unknown IDs and were ignored).
-
-| Who restarts | What goes wrong today |
-|---|---|
-| Sender | Serves the file but prints nothing; `/status` doesn't show it; keeps serving a transfer that is already over |
-| Receiver | peer-app finishes the download silently; server gets no events → "no response" failed after 120 s; sender never gets `TRANSFER_END` |
-| Receiver, back after > 30 s | Server already marked it failed ("peer left"), but peer-app keeps downloading |
-| Data lost (folder deleted, `*.bad`) | Server still shows the transfer; the other side waits up to 30 min for nothing |
-
-**Idea: lock + compare both lists.**
-
-1. **Lock on restore:** peer-app brings old transfers back **locked**. Nothing is sent or downloaded until Java says go or delete.
-2. **peer-app tells Java** what it restored: one line per item.
-3. **The server tells Java on login** which transfers are still active for this user (from Redis; for now a scan of `transfers:active`, later `transfers:user:<name>`).
-4. **Java compares the two lists:**
-
-| peer-app has it | Server: active | Java does |
-|---|---|---|
-| ✅ | ✅ | **go**: unlock, put it back in the list, print "restored · resumed"; later "done ✓" |
-| ✅ | ❌ (failed / done / unknown) | **delete**: `cancel <id>` (receiver, partial data removed) or `unshare <id>` (sender); print why |
-| ❌ | ✅ | **report failed** ("lost local data") so the other side stops waiting |
-
-Java saves nothing new: peer-app knows *what* (file, hash, bytes on disk), the server knows *who and how far* (from, to, state, %). The server stays the source of truth.
-
-**Changes**
-
-| Where | Change |
-|---|---|
-| peer-app | Restore offers and fetches **locked**; print `EVENT:RESTORED_OFFER:<id>:<hash>:<name>` / `EVENT:RESTORED_FETCH:<id>:<hash>:<name>:<bytes_on_disk>`; new command `release <id>` (offer); fetch "go" = `retry <id>`, delete = `cancel <id>` / `unshare <id>` (exist) |
-| Server | On login, send the user's active transfers: `MY_TRANSFERS\|<id>:<state>:<from>:<to>:<pct>,…` |
-| Java client | Collect both lists, compare, then go / delete / report failed; terminal + `/status` show restored transfers |
-| Docs | peer-app protocol (new events, `release`), mesh-v2 (`MY_TRANSFERS`) |
-
-**Notes**
-- **Sender back, receiver tries too early:** a locked offer refuses the fetch; the receiver's next quick try (5–10 s) works. No extra code.
-- **Java never answers** (crash, old version): locked items expire with the normal TTL (30 min). Nothing breaks.
-- Queued transfers (not started yet) are in memory only and are **not** restored; the user sends again.
-
-**Tests**
-
-| Test | Pass |
-|---|---|
-| Close the sender mid-transfer, open it again | Sender terminal: "restored" → "done ✓"; receiver and mesh complete; counted once |
-| Restart the receiver within 30 s | Resumes from the kept data; mesh continues; sender gets `TRANSFER_END` |
-| Restart the receiver after > 30 s (server says failed) | Partial download deleted; clear message; nothing counted twice |
-| Sender restarts after the transfer already failed or expired | Offer unshared at start, with a message |
-| Delete the receiver's data folder, restart | Java reports failed at once; sender stops serving |
-| Both restart | Completes after both are back |
-
-**Decide before coding:** a receiver back after the server said failed → **cancel** (suggested: simple, the server stays the boss) or let it finish late?
-
+- Findings (7 cases before B3c): [Before-PhaseB3c-restart-sync-findings.md](../problems/Before-PhaseB3c-restart-sync-findings.md)
+- Fix design: [PhaseB3c-restart-sync-paln.md](../fixes/PhaseB3c-restart-sync-paln.md)
 ### Open questions
 
 | Question | Options | Decide in |
