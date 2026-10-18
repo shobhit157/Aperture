@@ -22,6 +22,10 @@
 //! server, then sends `retry <id>` (go) or `cancel <id>` (delete). Saved
 //! offers come back as before (the sender only answers requests) and are
 //! reported too (RESTORED_OFFER), so Java knows them.
+//!
+//! B3d: connect timeout 10 s (iroh-blobs' 1 s made every first try fail);
+//! the quick tries start counting again after data moved; dropped offers
+//! (changed, gone, or expired while off) are reported with their name.
 
 use anyhow::{anyhow, Result};
 use iroh::{
@@ -65,6 +69,10 @@ const EXPIRY_CHECK_SECS: u64 = 5;
 /// B2b-2: after a failed try, wait this long and try again by itself
 /// (short hiccups: just started, network blip). Then FETCH_WAITING.
 const QUICK_RETRY_SECS: [u64; 3] = [5, 10, 20];
+/// B3d: how long one try may take to connect to the sender. iroh-blobs'
+/// default is 1 s, but finding the sender (DNS lookup, ~0.7 s) plus the
+/// relay connect often takes longer, so the first try always failed.
+const CONNECT_TIMEOUT_SECS: u64 = 10;
 
 // ---------------------------------------------------------- expiry (B2b-2)
 
@@ -271,7 +279,14 @@ impl Blobs {
         tokio::spawn(provider_events(rx, access.clone(), endpoint.clone()));
 
         let protocol = BlobsProtocol::new(&store, Some(events));
-        let downloader = store.downloader(endpoint);
+        let downloader = Downloader::new_with_opts(
+            &store,
+            endpoint,
+            iroh_blobs::util::connection_pool::Options {
+                connect_timeout: Duration::from_secs(CONNECT_TIMEOUT_SECS),
+                ..Default::default()
+            },
+        );
         let blobs = Blobs {
             store,
             endpoint: endpoint.clone(),
@@ -296,13 +311,17 @@ impl Blobs {
     // ------------------------------------------------------- restart (B2b-1)
 
     /// Sender side, at startup: bring saved offers back. An offer whose file
-    /// changed or disappeared while peer-app was off is dropped. Expired
-    /// offers are skipped (the expiry check removes them a moment later).
+    /// changed or disappeared while peer-app was off is dropped.
+    /// B3d: an offer that expired while peer-app was off is dropped and
+    /// reported here too (OFFER_DROPPED with its name).
     /// B3c: returns what came back, so main can report each one to Java.
     pub async fn restore_offers(&self) -> Vec<RestoredOffer> {
         let mut restored = Vec::new();
         for (id, rec) in self.state.offers() {
             if expired_now(rec.created_ms) {
+                // B3d: report it now (Java tells the user), instead of the
+                // expiry check doing it after Java's restart check is done.
+                self.drop_saved_offer(&id, "expired while peer-app was off", &rec).await;
                 continue;
             }
             match self.check_offer(&id, &rec).await {
@@ -317,16 +336,24 @@ impl Blobs {
                         name: display_name(&rec.path),
                     });
                 }
-                Err(reason) => {
-                    println!("EVENT:OFFER_DROPPED:{id}:{}", clean(&reason));
-                    if let Err(e) = self.state.remove_offer(&id) {
-                        report_state_error(e);
-                    }
-                    let _ = self.store.tags().delete(tag_out(&id)).await;
-                }
+                Err(reason) => self.drop_saved_offer(&id, &reason, &rec).await,
             }
         }
         restored
+    }
+
+    /// B3d: `EVENT:OFFER_DROPPED:<id>:<reason>|<name>` (clean() removes '|'
+    /// from both, so the last '|' splits them), then forget the offer.
+    async fn drop_saved_offer(&self, id: &str, reason: &str, rec: &OfferRecord) {
+        println!(
+            "EVENT:OFFER_DROPPED:{id}:{}|{}",
+            clean(reason),
+            clean(&display_name(&rec.path))
+        );
+        if let Err(e) = self.state.remove_offer(id) {
+            report_state_error(e);
+        }
+        let _ = self.store.tags().delete(tag_out(id)).await;
     }
 
     async fn check_offer(&self, id: &str, rec: &OfferRecord) -> std::result::Result<Hash, String> {
@@ -631,13 +658,16 @@ impl Blobs {
         let task_id = id.clone();
         let task = tokio::spawn(async move {
             let id = task_id;
+            let mut have = this.bytes_on_disk(req.hash, req.size).await;
             let mut result = this.do_fetch(&req).await;
 
             // B2b-2: quick tries for short hiccups. Each one resumes from
             // the chunks already received. Stops early if peer-app is
             // stopping, the fetch was cancelled, or its time is over.
-            for (n, secs) in QUICK_RETRY_SECS.iter().enumerate() {
-                let Err(reason) = &result else { break };
+            // B3d: a try that moved data before failing is a new problem
+            // (e.g. the sender left at 50%), so counting starts again at 1.
+            let mut tries = 0usize;
+            while let Err(reason) = &result {
                 if this.stopping.load(Ordering::SeqCst) {
                     break;
                 }
@@ -645,12 +675,15 @@ impl Blobs {
                     Some(rec) if !expired_now(rec.created_ms) => {}
                     _ => break, // cancelled or expired
                 }
-                println!(
-                    "EVENT:FETCH_RETRYING:{id}:{}:{secs}:{}",
-                    n + 1,
-                    clean(reason)
-                );
-                tokio::time::sleep(Duration::from_secs(*secs)).await;
+                let now_have = this.bytes_on_disk(req.hash, req.size).await;
+                if now_have > have {
+                    have = now_have;
+                    tries = 0;
+                }
+                let Some(secs) = QUICK_RETRY_SECS.get(tries).copied() else { break };
+                tries += 1;
+                println!("EVENT:FETCH_RETRYING:{id}:{tries}:{secs}:{}", clean(reason));
+                tokio::time::sleep(Duration::from_secs(secs)).await;
                 if this.stopping.load(Ordering::SeqCst) {
                     break;
                 }
