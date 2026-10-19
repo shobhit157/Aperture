@@ -44,6 +44,13 @@ public class TransferTracker {
     private static final long PEER_LEFT_GRACE_MS = 30_000;
     // Backup only: peers normally report every outcome themselves.
     private static final long NO_RESPONSE_MS = 120_000;
+    
+
+    // B3d: after a server start, wait before the first sweep. Clients need a
+    // moment to reconnect and send what happened while the server was down;
+    // without this every transfer would look "silent" and be failed at once.
+    private static final long START_GRACE_MS = 3 * 60_000;
+    
     private static final long SWEEP_EVERY_MS = 15_000;
     // B3b: a waiting transfer is failed by the backup only this long after
     // its wait_until (normally the receiver reports "expired" itself first).
@@ -74,8 +81,9 @@ public class TransferTracker {
     }
 
     public void startSweeper() {
+        // B3d: first sweep after START_GRACE_MS, then every SWEEP_EVERY_MS.
         scheduler.scheduleAtFixedRate(this::sweepSilent,
-                SWEEP_EVERY_MS, SWEEP_EVERY_MS, TimeUnit.MILLISECONDS);
+                START_GRACE_MS, SWEEP_EVERY_MS, TimeUnit.MILLISECONDS);
     }
 
     /** The receiver accepted: from = sender, to = receiver. */
