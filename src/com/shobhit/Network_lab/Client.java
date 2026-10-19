@@ -17,6 +17,7 @@ import java.util.Random;
 import java.util.Scanner;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -306,6 +307,8 @@ public class Client {
             } catch (IOException e) {
                 System.out.println("\nConnection lost (attempt " + attemptCounter[0]
                         + ", was connected for " + sessionDurationSeconds[0] + "s): " + e.getMessage());
+                
+                transfers.onDisconnected(); // B3d: warn once; results wait in the outbox
 
                 if (sessionDurationSeconds[0] >= HEALTHY_SESSION_SECONDS) {
                     currentDelaySeconds[0] = RECONNECT_DELAY_START_SECONDS;
@@ -784,6 +787,15 @@ public class Client {
         private List<String[]> serverBuilding = new ArrayList<>();
         private List<String[]> serverList = null;          // complete MY_TRANSFERS list
         private boolean synced = false;                    // compared once, never again
+        
+
+        // B3d: server lost. Final events (done / failed / TRANSFER_END) made
+        // while offline wait in the outbox and are sent after the next login,
+        // so the server's record ends up right (D1 dashboard, history).
+        static final int OUTBOX_MAX = 500;
+        private final Deque<String[]> outbox = new ConcurrentLinkedDeque<>(); // {id, line}
+        private boolean offline = false;       // lost the server since the last login
+        private boolean loggedInOnce = false;  // no "back online" before the first login
 
         void init(PrintWriter[] currentOut, PrintWriter peerWriter, Predicate<String> isOnline, String me) {
             this.currentOut = currentOut;
@@ -1433,6 +1445,58 @@ public class Client {
         void onLogin() {
             synchronized (lock) {
                 serverBuilding = new ArrayList<>();
+                loggedInOnce = true;
+                if (!offline) return;
+                offline = false;
+                // B3d: back after an outage: send what waited in the outbox,
+                // then the current state of running transfers.
+                PrintWriter out = out();
+                java.util.Set<String> sentIds = new java.util.HashSet<>();
+                String[] e;
+                while (out != null && (e = outbox.pollFirst()) != null) {
+                    out.println(e[1]);
+                    sentIds.add(e[0]); // done + TRANSFER_END of one transfer count once
+                }
+                reannounce();
+                say("[sync] back online · in sync with the server"
+                        + (sentIds.isEmpty() ? "" : " (" + sentIds.size()
+                                + " result(s) from while it was away sent)"));
+            }
+        }
+
+        /** B3d: the connection to the server is gone (called by the reconnect loop). */
+        void onDisconnected() {
+            synchronized (lock) {
+                if (offline || !loggedInOnce) return; // warn once per outage
+                offline = true;
+                int running = 0;
+                for (Transfer t : byId.values()) {
+                    if (t.phase.equals("moving") || t.phase.equals("fetching") || t.phase.equals("serving")) {
+                        running++;
+                    }
+                }
+                if (running > 0) {
+                    say("⚠ server lost · " + running + " transfer(s) continue directly (peer-to-peer)."
+                            + " Results are kept and sent when the server is back.");
+                }
+            }
+        }
+
+        // Caller holds lock. B3d: tell the server where running receives are
+        // now; their progress / waiting events were dropped while offline.
+        private void reannounce() {
+            long now = System.currentTimeMillis();
+            for (Transfer t : byId.values()) {
+                if (t.dir != Dir.RECEIVE) continue;
+                if (t.phase.equals("moving") || t.phase.equals("fetching")) {
+                    t.pctSent = -1; // force it out
+                    flushProgress(t);
+                } else if (t.phase.equals("waiting") && t.lockedUntil > now) {
+                    t.pctSent = -1;
+                    flushProgress(t);
+                    sendEvent(t.id, "waiting", "secs=" + ((t.lockedUntil - now) / 1000),
+                            "reason=sender offline");
+                }
             }
         }
 
@@ -1703,13 +1767,27 @@ public class Client {
         }
 
         private void sendEvent(String id, String state, String... fields) {
-            PrintWriter out = out();
-            if (out == null) return;
             StringBuilder sb = new StringBuilder("TRANSFER_EVENT|id=").append(id).append("|state=").append(state);
             for (String f : fields) {
                 sb.append('|').append(f.replace('|', ' ').replace('\n', ' '));
             }
-            out.println(sb);
+            // B3d: only the final result is worth keeping for later.
+            send(id, sb.toString(), state.equals("done") || state.equals("failed"));
+        }
+
+        // B3d: send now; if offline (or the write fails), keep final events
+        // in the outbox. Progress / path / waiting are not kept: reannounce()
+        // sends the current state after the next login instead.
+        private void send(String id, String line, boolean keepIfOffline) {
+            PrintWriter out = out();
+            if (out != null) {
+                out.println(line);
+                if (!out.checkError()) return; // sent
+                // the connection just died under us: fall through and keep it
+            }
+            if (keepIfOffline && outbox.size() < OUTBOX_MAX) {
+                outbox.addLast(new String[] { id, line });
+            }
         }
 
         // B3b: TRANSFER_END|<other user>|<id>|<state>|<reason> to the server.
@@ -1717,12 +1795,10 @@ public class Client {
             sendTransferEnd(t.peer, t.id, state, reason);
         }
 
-        // B3c: also for a transfer Java doesn't hold (restart check).
         private void sendTransferEnd(String peer, String id, String state, String reason) {
-            PrintWriter out = out();
-            if (out == null) return;
-            out.println("TRANSFER_END|" + peer + "|" + id + "|" + state + "|"
-                    + (reason == null ? "" : reason.replace('|', ' ').replace('\n', ' ')));
+            // B3d: always final, so kept in the outbox when offline.
+            send(id, "TRANSFER_END|" + peer + "|" + id + "|" + state + "|"
+                    + (reason == null ? "" : reason.replace('|', ' ').replace('\n', ' ')), true);
         }
 
         private static String arrow(Transfer t) {
