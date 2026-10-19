@@ -48,6 +48,15 @@ public class Client {
     // B3d: peer-app never got ready (crashed, or no network): exit code + time limit.
     private static final int EXIT_CODE_PEER_FAILED = 4;
     private static final long PEER_START_TIMEOUT_MS = 60_000;
+    
+
+    // B3d: stop reconnecting when the server stays unreachable this long.
+    // Safe: peer-app keeps transfers on disk; B3c resumes them on the next start.
+    // RECONNECT_GIVE_UP_SECS overrides it (handy for testing).
+    private static final long GIVE_UP_AFTER_MS =
+            Transfers.envInt("RECONNECT_GIVE_UP_SECS", 10 * 60) * 1000L;
+    private static final int EXIT_CODE_SERVER_UNREACHABLE = 5;
+    
 
     private static final List<String> CHAT_MESSAGES = List.of(
             "hey everyone",
@@ -274,6 +283,8 @@ public class Client {
 
         long[] currentDelaySeconds = { RECONNECT_DELAY_START_SECONDS };
         int[] attemptCounter = { 0 };
+        
+        long[] offlineSince = { 0 }; // B3d: when the current outage began (0 = online)
 
         while (!shuttingDown.get()) {
             attemptCounter[0]++;
@@ -298,9 +309,23 @@ public class Client {
 
                 if (sessionDurationSeconds[0] >= HEALTHY_SESSION_SECONDS) {
                     currentDelaySeconds[0] = RECONNECT_DELAY_START_SECONDS;
+                    offlineSince[0] = 0; // B3d: it was a good session: new outage
                 }
 
-                System.out.println("Reconnecting in " + currentDelaySeconds[0] + "s...");
+                // B3d: give up if the server has been unreachable for too long.
+                long now = System.currentTimeMillis();
+                if (offlineSince[0] == 0) offlineSince[0] = now;
+                long offlineMs = now - offlineSince[0];
+                if (offlineMs >= GIVE_UP_AFTER_MS) {
+                    shuttingDown.set(true);
+                    System.out.println("Server unreachable for " + (offlineMs / 1000) + "s, giving up."
+                            + " Saved transfers resume when you start the client again.");
+                    // The shutdown hook stops peer-app.
+                    System.exit(EXIT_CODE_SERVER_UNREACHABLE);
+                }
+
+                System.out.println("Reconnecting in " + currentDelaySeconds[0] + "s... (offline "
+                        + (offlineMs / 1000) + "s, giving up after " + (GIVE_UP_AFTER_MS / 1000) + "s)");
                 try {
                     Thread.sleep(currentDelaySeconds[0] * 1000L);
                 } catch (InterruptedException ignored) {}
