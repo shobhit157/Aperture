@@ -723,6 +723,7 @@ public class Client {
             int lastMilestone = 0;
             long lastActivity = System.currentTimeMillis();
             long lastProgressSent = 0;
+            int pctSent = 0;            // B3d: last % the server got (receive side)
             long lastResumeAt = 0;      // B3b: last time we sent `retry` for it
             boolean restored = false;   // B3c: came back after a restart
             
@@ -1072,6 +1073,7 @@ public class Client {
                 // of a line that looks like it is still moving. It also keeps
                 // the record alive (the tries can take longer than the
                 // server's 120 s "no response" backup).
+                flushProgress(t); // B3d: the mesh shows the real % while retrying
                 sendEvent(t.id, "retrying", "retry=" + n + "/3");
             }
         }
@@ -1086,6 +1088,7 @@ public class Client {
                 // Give the slot back: other files can be received meanwhile.
                 activeReceives.remove(t);
                 receiveQueue.remove(t);
+                flushProgress(t); // B3d: the mesh shows the % that is really kept
                 sendEvent(t.id, "waiting", "secs=" + secsLeft, "reason=" + shorten(reason));
                 // Minutes rounded up, the same as the mesh shows.
                 t.lockedUntil = System.currentTimeMillis() + secsLeft * 1000;
@@ -1384,9 +1387,20 @@ public class Client {
                 long now = System.currentTimeMillis();
                 if (t.dir == Dir.RECEIVE && now - t.lastProgressSent >= PROGRESS_FORWARD_MS) {
                     t.lastProgressSent = now;
+                    t.pctSent = pct;
                     sendEvent(t.id, "progress", "pct=" + pct);
                 }
             }
+        }
+        
+        // B3d: progress goes to the server at most every 3 s, so the last
+        // few % can be missing when a transfer stops. Send them now.
+        // Caller holds lock.
+        private void flushProgress(Transfer t) {
+            if (t.dir != Dir.RECEIVE || t.pct <= t.pctSent) return;
+            t.pctSent = t.pct;
+            t.lastProgressSent = System.currentTimeMillis();
+            sendEvent(t.id, "progress", "pct=" + t.pct);
         }
 
         private void onPath(String id, String path) {
