@@ -340,15 +340,17 @@ public class Client {
                     }
                     knownUsers.clear();
                     knownUsers.addAll(fresh);
+                    // B3d: print who is online FIRST, then resume transfers,
+                    // so "is back" never shows before the user list.
+                    if (!isBot) {
+                        System.out.println("Online now: "
+                                + (fresh.isEmpty() ? "(nobody else)" : String.join(", ", fresh)));
+                    }
                     // B3c: a new login; MY_TRANSFER lines follow.
                     transfers.onLogin();
                     // B3b: anyone we were waiting for may be back.
                     for (String u : fresh) {
                         transfers.onUserBack(u);
-                    }
-                    if (!isBot) {
-                        System.out.println("Online now: "
-                                + (fresh.isEmpty() ? "(nobody else)" : String.join(", ", fresh)));
                     }
                     continue;
                 }
@@ -358,15 +360,23 @@ public class Client {
                     if (!who.equals(myUsername) && !knownUsers.contains(who)) {
                         knownUsers.add(who);
                     }
+                    // B3d: show the JOIN line first, then "is back" + resume events.
+                    System.out.println(line);
                     // B3b: "sender back online" — resume waiting fetches from them.
                     if (!who.equals(myUsername)) {
                         transfers.onUserBack(who);
                     }
-                } else if (line.startsWith("<<< ") && line.contains(" left the chat")) {
+                    continue; // already printed
+                }
+
+                if (line.startsWith("<<< ") && line.contains(" left the chat")) {
                     String who = line.substring(4, line.indexOf(" left the chat"));
                     knownUsers.remove(who);
+                    // B3d: show the LEFT line first, then what it means for transfers.
+                    System.out.println(line);
                     // Mesh v2 S2: anything waiting on that user can't happen now.
                     transfers.onUserLeft(who);
+                    continue; // already printed
                 }
 
                 if (line.startsWith("FILE_REQUEST|")) {
@@ -588,6 +598,10 @@ public class Client {
         // this often by the ticker (in case its JOIN was missed, or the
         // sender's peer-app wasn't serving yet when we last tried).
         static final long RESUME_RETRY_MS = 60_000;
+        
+
+        // B3d: how long peer-app keeps an offer (same env var peer-app reads).
+        static final long TRANSFER_TTL_MS = envInt("PEER_TRANSFER_TTL_SECS", 30 * 60) * 1000L;
 
         // B3a: settings (environment variables).
         static final boolean USE_BLOBS =
@@ -619,6 +633,11 @@ public class Client {
             long lastProgressSent = 0;
             long lastResumeAt = 0;      // B3b: last time we sent `retry` for it
             boolean restored = false;   // B3c: came back after a restart
+            
+            long sharedAt = 0;          // B3d: send, when peer-app's offer started (0 = unknown)
+            boolean peerAway = false;   // B3d: send, the receiver left while we serve
+            
+            long lockedUntil = 0;       // B3d: receive, waiting: when peer-app gives up (0 = unknown)
 
             Transfer(String id, Dir dir, String peer, String name, String filePath, long size) {
                 this.id = id;
@@ -716,6 +735,7 @@ public class Client {
                     // B3a step 1: hash the file first; FILE_REQUEST goes out on SHARED.
                     t.phase = "sharing";
                     t.shared = true;
+                    t.sharedAt = System.currentTimeMillis(); // B3d: offer lifetime starts now
                     peerWriter.println("share " + t.id + " " + t.filePath);
                     say("[send] " + t.name + " -> " + t.peer + "   preparing (" + human(t.size) + ")");
                 } else {
@@ -856,9 +876,10 @@ public class Client {
             }
         }
 
-        // EVENT:OFFER_EXPIRED:<id> / EVENT:OFFER_DROPPED:<id>:<reason>
+        // EVENT:OFFER_EXPIRED:<id> / EVENT:OFFER_DROPPED:<id>:<reason>|<name>
         // rawReason: peer-app's own words (e.g. "file changed while peer-app was off").
-        private void onOfferGone(String id, String reason, String rawReason) {
+        // fileName: B3d, from peer-app ("" if unknown).
+        private void onOfferGone(String id, String reason, String rawReason, String fileName) {
             synchronized (lock) {
                 Transfer t = byId.get(id);
                 if (t == null) {
@@ -867,7 +888,10 @@ public class Client {
                     if (!synced) {
                         restored.remove(id);
                         droppedAtStart.put(id, rawReason);
-                        say("[restart] a saved share was dropped: " + rawReason);
+                        // B3d: show WHICH file (also covers offers that
+                        // expired while peer-app was off).
+                        say("[restart] saved share " + (fileName.isEmpty() ? "" : fileName + " ")
+                                + "dropped: " + rawReason);
                     }
                     return;
                 }
@@ -972,10 +996,19 @@ public class Client {
                 receiveQueue.remove(t);
                 sendEvent(t.id, "waiting", "secs=" + secsLeft, "reason=" + shorten(reason));
                 // Minutes rounded up, the same as the mesh shows.
-                say(arrow(t) + "   waiting for " + t.peer + " (" + ((secsLeft + 59) / 60) + " min left, "
-                        + t.pct + "% kept)");
+                t.lockedUntil = System.currentTimeMillis() + secsLeft * 1000;
+                say(arrow(t) + "   🔒 locked: " + t.pct + "% kept, waiting for " + t.peer
+                        + lockLeft(t) + " — resumes when they're back");
                 startNextReceive();
             }
+        }
+        
+
+        // B3d: " (N min left)" until peer-app gives up on a locked transfer.
+        private static String lockLeft(Transfer t) {
+            if (t.lockedUntil == 0) return "";
+            long ms = t.lockedUntil - System.currentTimeMillis();
+            return ms <= 0 ? " (expiring)" : " (" + ((ms + 59_999) / 60_000) + " min left)";
         }
 
         /** B3b: a user is online again (JOIN, or in the ONLINE list after our reconnect). */
@@ -985,6 +1018,10 @@ public class Client {
                     if (t.dir == Dir.RECEIVE && t.peer.equals(who) && t.phase.equals("waiting")) {
                         say(arrow(t) + "   " + who + " is back");
                         resumeOrQueue(t);
+                    } else if (t.dir == Dir.SEND && t.peer.equals(who) && t.peerAway) {
+                        // B3d: the receiver resumes by itself; we only say so.
+                        t.peerAway = false;
+                        say(arrow(t) + "   " + who + " is back");
                     }
                 }
             }
@@ -1136,12 +1173,17 @@ public class Client {
                 return true;
             }
             if (line.startsWith("EVENT:OFFER_EXPIRED:")) {
-                onOfferGone(idAndRest(line, "EVENT:OFFER_EXPIRED:")[0], "offer expired", "offer expired");
+                onOfferGone(idAndRest(line, "EVENT:OFFER_EXPIRED:")[0], "offer expired", "offer expired", "");
                 return true;
             }
             if (line.startsWith("EVENT:OFFER_DROPPED:")) {
+                // B3d: EVENT:OFFER_DROPPED:<id>:<reason>|<name>
                 String[] kv = idAndRest(line, "EVENT:OFFER_DROPPED:");
-                onOfferGone(kv[0], "offer dropped: " + kv[1], kv[1]);
+                String rest = kv[1];
+                int bar = rest.lastIndexOf('|');
+                String why  = bar >= 0 ? rest.substring(0, bar) : rest;   // old peer-app: no '|'
+                String file = bar >= 0 ? rest.substring(bar + 1) : "";
+                onOfferGone(kv[0], "offer dropped: " + why, why, file);
                 return true;
             }
             if (line.startsWith("EVENT:RESUMED:")) {
@@ -1429,11 +1471,25 @@ public class Client {
                             || t.phase.equals("allowed");
                     if (notStarted) {
                         finish(t, false, who + " left", false);
+                    } else if (t.dir == Dir.SEND && t.phase.equals("serving") && !t.peerAway) {
+                        // B3d: our peer-app keeps the offer, so the receiver can
+                        // still resume. Say so plainly — nothing failed.
+                        t.peerAway = true;
+                        say(arrow(t) + "   " + who + " left the chat — still sharing" + minutesLeft(t));
                     }
                     // Transfers already moving (or served by peer-app) end on
                     // their own: peer-app reports the result, the server marks it.
                 }
             }
+        }
+        
+
+        // B3d: " (up to N min)" until the offer expires; "" if unknown (restored).
+        private static String minutesLeft(Transfer t) {
+            if (t.sharedAt == 0) return "";
+            long msLeft = t.sharedAt + TRANSFER_TTL_MS - System.currentTimeMillis();
+            if (msLeft <= 0) return "";
+            return " (up to " + ((msLeft + 59_999) / 60_000) + " min)";
         }
 
         // Called every TICK_MS by the ticker thread.
@@ -1515,7 +1571,9 @@ public class Client {
                 }
                 for (Transfer t : byId.values()) {
                     if (t.dir == Dir.RECEIVE && t.phase.equals("waiting")) {
-                        sb.append("      waiting for sender: ").append(describe(t)).append("\n");
+                        sb.append("      🔒 ").append(t.name).append(" <- ").append(t.peer)
+                        .append("  locked, ").append(t.pct).append("% kept, waiting for ").append(t.peer)
+                        .append(lockLeft(t)).append("\n");
                     }
                 }
                 System.out.print(sb);
@@ -1609,4 +1667,4 @@ public class Client {
             return bytes + " B";
         }
     }
-}
+}
