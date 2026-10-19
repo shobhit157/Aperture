@@ -43,6 +43,11 @@ public class Client {
     // Process ownership: exit code used when another process took over
     // this username, so logs and Kubernetes show why the client stopped.
     private static final int EXIT_CODE_SUPERSEDED = 3;
+    
+
+    // B3d: peer-app never got ready (crashed, or no network): exit code + time limit.
+    private static final int EXIT_CODE_PEER_FAILED = 4;
+    private static final long PEER_START_TIMEOUT_MS = 60_000;
 
     private static final List<String> CHAT_MESSAGES = List.of(
             "hey everyone",
@@ -145,6 +150,29 @@ public class Client {
         String peerLine;
         String myEndpointId = null;
         String myRelayUrl = null;
+        
+        // B3d: peer-app must report its endpoint and relay before we log in.
+        // If it dies, or hangs (e.g. no network), stop with a clear message
+        // instead of logging in with "endpoint: null".
+        Deque<String> lastPeerLines = new ArrayDeque<>(); // shown if startup fails
+        AtomicBoolean peerReady = new AtomicBoolean(false);
+        Thread startWatchdog = new Thread(() -> {
+            try {
+                Thread.sleep(PEER_START_TIMEOUT_MS);
+            } catch (InterruptedException e) {
+                return; // peer-app got ready in time
+            }
+            if (!peerReady.get()) {
+                System.out.println("peer-app did not get ready in " + (PEER_START_TIMEOUT_MS / 1000)
+                        + "s, stopping it.");
+                // Kill its child processes too: a child that still holds the
+                // output pipe would keep readLine() below waiting.
+                peerProcess.descendants().forEach(ProcessHandle::destroyForcibly);
+                peerProcess.destroyForcibly(); // readLine() below then returns null
+            }
+        }, "peer-start-watchdog");
+        startWatchdog.setDaemon(true);
+        startWatchdog.start();
 
         while ((peerLine = peerOut.readLine()) != null) {
             if (peerLine.startsWith("EVENT:ENDPOINT_READY:")) {
@@ -157,9 +185,28 @@ public class Client {
                 // restart check can tell the receiver why.
                 transfers.onPeerEvent(peerLine);
             }
+            
+            else {
+                // B3d: keep the last few lines, in case startup fails.
+                lastPeerLines.addLast(peerLine);
+                if (lastPeerLines.size() > 5) lastPeerLines.removeFirst();
+            }
+            
             if (myEndpointId != null && myRelayUrl != null) {
+                peerReady.set(true);
                 break;
             }
+        }
+        startWatchdog.interrupt();
+
+        if (!peerReady.get()) {
+            System.out.println("Could not start peer-app: "
+                    + (myEndpointId == null ? "no endpoint" : "no relay") + ". Last output:");
+            for (String l : lastPeerLines) {
+                System.out.println("  [peer-app] " + l);
+            }
+            // The shutdown hook stops peer-app if it is still running.
+            System.exit(EXIT_CODE_PEER_FAILED);
         }
         System.out.println("Local peer-app ready, endpoint: " + myEndpointId + ", relay: " + myRelayUrl);
 
@@ -306,12 +353,7 @@ public class Client {
             if (isBot) {
                 System.out.println("Bot ready. Waiting for commands (!chat, !send)...");
             } else {
-                System.out.println("Commands:");
-                System.out.println("  <message>                              - send a chat message");
-                System.out.println("  /send <username> <file_path>           - send a file to a user");
-                System.out.println("  /status                                - show active and queued transfers");
-                System.out.println("  !chat <all|username>                   - tell bots to send a chat message");
-                System.out.println("  !send <bot|all> <recipient|all> <small|medium|large> - tell bots to send a file");
+            	 printHelp();
             }
 
             String line;
@@ -482,11 +524,24 @@ public class Client {
 
     private static void runInteractiveInput(PrintWriter[] currentOut) {
         Scanner sc = new Scanner(System.in);
-        while (true) {
-            String input = sc.nextLine();
+        while (sc.hasNextLine()) {
+            // B3d: ignore spaces around the input (" /status " works too).
+            String input = sc.nextLine().trim();
+            if (input.isEmpty()) continue; // nothing to send
 
             if (input.equals("/status")) {
                 transfers.printStatus();
+                continue;
+            }
+            if (input.equals("/help")) {
+                printHelp();
+                continue;
+            }
+
+            boolean isSend = input.equals("/send") || input.startsWith("/send ");
+            // B3d: a typo like "/stauts" must not go out as a chat message.
+            if (input.startsWith("/") && !isSend) {
+                System.out.println("unknown command: " + input.split("\\s+")[0] + "  (type /help)");
                 continue;
             }
 
@@ -496,8 +551,9 @@ public class Client {
                 continue;
             }
 
-            if (input.startsWith("/send ")) {
-                String[] parts = input.substring(6).split(" ", 2);
+            if (isSend) {
+                // "/send  admin2   my file.bin" -> ["admin2", "my file.bin"]
+                String[] parts = input.substring("/send".length()).trim().split("\\s+", 2);
                 if (parts.length != 2) {
                     System.out.println("usage: /send <username> <file_path>");
                     continue;
@@ -507,6 +563,17 @@ public class Client {
                 out.println(input);
             }
         }
+    }
+
+    // B3d: one place for the command list (shown on connect and on /help).
+    private static void printHelp() {
+        System.out.println("Commands:");
+        System.out.println("  <message>                              - send a chat message");
+        System.out.println("  /send <username> <file_path>           - send a file to a user");
+        System.out.println("  /status                                - show active and queued transfers");
+        System.out.println("  /help                                  - show this list");
+        System.out.println("  !chat <all|username>                   - tell bots to send a chat message");
+        System.out.println("  !send <bot|all> <recipient|all> <small|medium|large> - tell bots to send a file");
     }
 
     private static long parseLong(String s) {
