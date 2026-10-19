@@ -89,6 +89,10 @@
  * receiver that went offline (or restarted) is waited for the same way:
  * "waiting for receiver", until the transfer's 30 min are up.
  *
+ * B3d: the user a transfer waits for is drawn faded ("offline"), unless
+ * another transfer shows them active. A receiver that already had the file
+ * finishes with path "none": shown as "already had it", not as a path.
+ *
  * Everything is keyed by transfer id. Each transfer is its own line, so two
  * transfers between the same users (or opposite directions) are drawn apart.
  */
@@ -156,7 +160,7 @@ function applyUpdate(t, fromSnapshot = false) {
   // Log what changed.
   if (!prev) {
     log(cur, cur.path ? `started (${cur.path})` : 'started', cur.path || 'pending');
-  } else if (cur.path && cur.path !== prev.path) {
+  } else if (cur.path && cur.path !== prev.path && cur.path !== 'none') { // B3d: 'none' is not a path
     log(cur, prev.path ? `path ${prev.path} -> ${cur.path}` : `path ${cur.path}`, cur.path);
   }
   // B3b: connection lost / sender gone / sender back.
@@ -169,7 +173,12 @@ function applyUpdate(t, fromSnapshot = false) {
   }
   if (isFinal(cur.state)) {
     cur.finishedAt = now;
-    if (cur.state === 'done') { doneCount++; log(cur, `done (${cur.path || '?'})`, cur.path || 'direct'); }
+    if (cur.state === 'done') {
+      doneCount++;
+      // B3d: path "none" = nothing was sent, the receiver already had the file.
+      if (alreadyHad(cur)) log(cur, 'done (already had it)', 'pending');
+      else log(cur, `done (${cur.path || '?'})`, cur.path || 'direct');
+    }
     else { failedCount++; log(cur, `failed: ${cur.reason || 'unknown'}`, 'failed'); }
   }
   transfers.set(cur.id, cur);
@@ -177,6 +186,17 @@ function applyUpdate(t, fromSnapshot = false) {
 }
 
 const isFinal = (s) => s === 'done' || s === 'failed';
+const alreadyHad = (t) => t.state === 'done' && t.path === 'none';
+
+// B3d: users that waiting transfers wait for, and nothing shows active.
+function awayUsers() {
+  const waitedFor = new Set(), active = new Set();
+  for (const t of transfers.values()) {
+    if (t.state === 'waiting') waitedFor.add(t.wait_for === 'receiver' ? t.to : t.from);
+    else if (t.state === 'moving' || t.state === 'started') { active.add(t.from); active.add(t.to); }
+  }
+  return new Set([...waitedFor].filter(u => !active.has(u)));
+}
 function touchNode(name, now) { if (name) nodesLastSeen.set(name, now); }
 
 function isStalled(t, now) {
@@ -201,6 +221,7 @@ function el(name, attrs, parent) {
 
 function colorOf(t, now) {
   if (t.state === 'failed') return 'failed';
+  if (alreadyHad(t)) return 'pending';
   if (t.state === 'waiting') return 'waiting';
   if (t.state === 'retrying') return 'retrying';
   if (isStalled(t, now) || !t.path) return 'pending';
@@ -270,7 +291,8 @@ function render() {
         'stroke-dasharray': dash, 'marker-end': `url(#arrow-${c})`,
         opacity: finished ? 0.55 : 1
       }, edges);
-      const label = t.state === 'done' ? 'done'
+      const label = alreadyHad(t) ? 'already had it'
+        : t.state === 'done' ? 'done'
         : t.state === 'failed' ? 'failed'
         : t.state === 'waiting' ? `waiting for ${waitWho(t)} · ${minutesLeft(t, now)} min left`
         : t.state === 'retrying' ? `reconnecting ${t.retry || ''}`.trim()
@@ -282,13 +304,18 @@ function render() {
   }
 
   const nodes = el('g', {}, svg);
+  const away = awayUsers(); // B3d
   for (const n of names) {
     const p = pos.get(n);
-    el('circle', { cx: p.x, cy: p.y, r: 18, fill: 'var(--panel)', stroke: 'var(--node)', 'stroke-width': 2 }, nodes);
-    const label = el('text', { x: p.x, y: p.y + 34, 'text-anchor': 'middle' }, nodes);
-    label.textContent = shortName(n);
+    const off = away.has(n);
+    const g = el('g', { opacity: off ? 0.45 : 1 }, nodes);
+    el('circle', { cx: p.x, cy: p.y, r: 18, fill: 'var(--panel)',
+      stroke: off ? 'var(--muted)' : 'var(--node)', 'stroke-width': 2,
+      'stroke-dasharray': off ? '4 3' : '' }, g);
+    const label = el('text', { x: p.x, y: p.y + 34, 'text-anchor': 'middle' }, g);
+    label.textContent = shortName(n) + (off ? ' (offline)' : '');
     const title = el('title', {}, label);
-    title.textContent = n;
+    title.textContent = off ? n + ' is offline; a transfer is waiting for them' : n;
   }
   if (names.length === 0) {
     const t = el('text', { x: 500, y: 350, 'text-anchor': 'middle', class: 'label' }, svg);
