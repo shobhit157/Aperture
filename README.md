@@ -1,81 +1,73 @@
 # Aperture
 
-**A learning lab for peer-to-peer networking.**
+### Send files straight to each other.
 
-Two computers sending files directly to each other, with no server in the middle. I break it on purpose (kill apps, drop the server, change files halfway) and then make it reliable.
-
-![Live mesh demo (sample data): direct and relay transfers, a sender going offline at 40% and resuming](docs/images/mesh-demo.gif)
-
----
-
-## How it works
+When you send a file today, it usually goes up to someone's server first and then down to your friend. Aperture skips that. A small server only helps two computers **find each other**. After that, the file goes **directly** from one to the other.
 
 ```mermaid
 flowchart LR
-    A["Peer A<br/>Java client + Rust peer-app"]
-    B["Peer B<br/>Java client + Rust peer-app"]
-    S["Signaling server<br/>Java · Redis · k3s"]
+    A["💻 Client A<br/>(sender)"]
+    B["💻 Client B<br/>(receiver)"]
+    S["🖥️ Server<br/>helps them meet"]
+    R["🔁 Relay<br/>backup path"]
 
-    A -- "who's online, chat,<br/>transfer requests" --> S
-    S -- "connection info" --> B
-    A == "file data (direct, or relay fallback)" ==> B
+    A -- "① I want to send B a file" --> S
+    S -- "② here's how to reach A" --> B
+    A == "③ file goes directly ✅" ==> B
+    A -. "④ only if direct fails" .-> R
+    R -. "still encrypted" .-> B
 ```
 
-- **Control plane:** a Java server helps peers find each other and tracks transfers.
-- **Data plane:** a Rust app on [Iroh](https://iroh.computer) moves the file peer to peer. It tries a direct connection first and falls back to a relay. File data never goes through the server.
-- **Every piece is checked** against the file's BLAKE3 fingerprint, so a broken or changed file can't get through.
+And if something goes wrong halfway (Wi-Fi drops, someone closes the app, even the server goes down), **the transfer doesn't start over**. It picks up where it stopped.
+
+![Live mesh demo (sample data)](docs/images/mesh-demo.gif)
+
+> Aperture is a personal project, not a finished app yet. Today it runs as a command-line client, with test bots keeping the network busy.
 
 ---
 
-## What it survives
+## Why it matters
 
-Tested on EC2 (k3s, 2 server pods), between two peers over the internet. Each one ended with a sha256 match.
+The internet relies on a few big servers. When they go down, or when a whole area gets cut off after a storm or an earthquake, people lose the ability to share anything at all.
 
-| What I broke | Result |
+Aperture is a step toward the other way. It starts with direct transfers that survive failures, and is heading toward **devices that can find each other and share on their own**, even when the network around them is broken.
+
+---
+
+## Watching it live
+
+The mesh shows every transfer as it happens.
+
+| You see | It means |
 |---|---|
-| Killed the sender at 84% | Receiver retried, waited, then **resumed from 84%** when the sender came back |
-| Killed the receiver at 71% | Sender kept sharing, receiver came back and **resumed from 71%** |
-| Changed the file while the sender was offline | Transfer **stopped**, and the receiver was told why |
-| **Scaled the server to 0** during a 1 GB transfer | Transfer **finished peer to peer**, and the results reached the server when it came back |
-
-Full test list and known issues: [PhaseB3d-cleanup.md](docs/fixes/PhaseB3d-cleanup.md)
-
----
-
-## Where it's at
-
-```mermaid
-flowchart LR
-  C[Reconnects] --> A[Honest transfers] --> M[Live mesh] --> I[Persistent identity] --> B[Resumable transfers] --> R[Restart sync] --> O[Survives server outages] --> D[Dashboard ...]
-```
-
-**Done:** Phase B3, file transfer on iroh-blobs. **Next:** D1, a live dashboard. See the [roadmap](docs/roadmap.md).
+| ⚪ Circle | A user (a person or a test bot) |
+| ➡️ Arrow | A file on its way, with how much has arrived |
+| 🟢 Green | Sent **directly**, computer to computer |
+| 🟠 Orange dashed | A direct path wasn't possible, so it goes through a **relay** (still encrypted) |
+| 🟡 Yellow dotted | The connection dropped and it's **reconnecting** |
+| 🟣 Purple dashed | The other side left, and the file is **saved and waiting** for them |
+| ◌ Faded circle | That user is **offline** |
+| ⚪ "already had it" | They already had this file, so nothing was sent |
 
 ---
 
-## What's in the repo
+## What you can count on
 
-| Path | What it is |
-|---|---|
-| `src/com/shobhit/Network_lab/` | Java signaling server (`Server.java`) and client (`Client.java`) |
-| `peer-app/` | Rust peer-app on Iroh + iroh-blobs |
-| `mesh.html` | Live mesh view: who's talking to whom, direct or relay |
-| `tools/` | Test scripts for peer-app |
-| `Dockerfile.*`, `k8s-*.yaml` | Images and k3s deployment |
-| `docs/` | Problems, fixes, decisions, plans ([start here](docs/README.md)) |
+- 🔒 **Private:** files are encrypted, and the file data never passes through or stays on a server
+- ✅ **Complete:** every piece is checked, so a broken or changed file can't arrive
+- 🔁 **Resumes:** if anything stops, it continues from the same spot (it waits up to 30 minutes for the other side)
+- 🛟 **Keeps going:** transfers already running finish even if the server goes down
+
+Each of these was tested by breaking it on purpose: [test results](docs/fixes/PhaseB3d-cleanup.md).
 
 ---
 
-## Built with
+## What's next
 
-Rust · Iroh · Java · Redis · AWS SNS/SQS · Docker · Kubernetes (k3s) · Prometheus · Grafana
+A dashboard to see the whole network at a glance, and later a simple app anyone can use.
+
+👉 [Roadmap](docs/roadmap.md) · [How it's built](docs/README.md)
 
 ---
 
-## Questions I'm still chasing
-
-- How often do peers really connect directly?
-- What does falling back to a relay cost?
-- What still needs a central server in a "decentralized" system?
-
-*Not production software, and not trying to be.*
+**Built with:** Rust · Iroh · Java · Redis · AWS SNS/SQS · Docker · Kubernetes (k3s) · Prometheus · Grafana
