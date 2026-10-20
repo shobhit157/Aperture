@@ -57,7 +57,7 @@
     <span><i style="border-color:var(--relay);border-top-style:dashed"></i>relay</span>
     <span><i style="border-color:var(--pending);border-top-style:dotted"></i>starting / stalled</span>
     <span><i style="border-color:var(--retrying);border-top-style:dotted"></i>reconnecting</span>
-    <span><i style="border-color:var(--waiting);border-top-style:dashed"></i>waiting for sender</span>
+    <span><i style="border-color:var(--waiting);border-top-style:dashed"></i>waiting (for sender / receiver)</span>
     <span><i style="border-color:var(--failed)"></i>failed</span>
   </div>
 </header>
@@ -78,13 +78,25 @@
  *   {"type":"update","transfer":T}             when one transfer changes (batched, <= 4/s)
  * T = {id, from, to, state: started|moving|retrying|waiting|done|failed, path: ""|direct|relay,
  *      pct, reason, age_ms (time since the transfer's last event),
- *      wait_left_ms, wait_reason, retry}
+ *      wait_left_ms, wait_reason, retry, wait_for}
  * B3b: retrying = the connection to the sender broke and the receiver is
  * trying again by itself (retry = "n/3"); shown yellow, dotted, "reconnecting n/3".
  * B3b: waiting = the sender is gone, the receiver keeps its chunks and waits
  * up to wait_left_ms for it. The line stays (purple, dashed) with the time
  * left; it turns back to normal when the transfer resumes, or fails (and
  * vanishes) when the receiver gives up.
+ * B3c: wait_for = "sender" | "receiver" says who is being waited for. A
+ * receiver that went offline (or restarted) is waited for the same way:
+ * "waiting for receiver", until the transfer's 30 min are up.
+ *
+ * B3d: the user a transfer waits for is drawn faded ("offline"), unless
+ * another transfer shows them active. A receiver that already had the file
+ * finishes with path "none": shown as "already had it", not as a path.
+ 
+ * B3d: when the mesh page itself loses the server (WebSocket closed), it keeps
+ * the last known state, dimmed, with a note, instead of calling every
+ * transfer "stalled".
+ *
  *
  * Everything is keyed by transfer id. Each transfer is its own line, so two
  * transfers between the same users (or opposite directions) are drawn apart.
@@ -105,11 +117,13 @@ let doneCount = 0, failedCount = 0;
 
 // ---------------- WebSocket (auto-reconnect) ----------------
 let ws, retryMs = 1000;
+let wsOpen = false, wasConnected = false; // B3d: is the mesh itself connected?
 function connect() {
   ws = new WebSocket('ws://' + location.hostname + ':' + WS_PORT);
-  ws.onopen = () => { setStatus('connected', 'ok'); retryMs = 1000; };
+  ws.onopen = () => { setStatus('connected', 'ok'); retryMs = 1000; wsOpen = wasConnected = true; render(); };
   ws.onclose = () => {
     setStatus('disconnected - retrying', 'bad');
+    wsOpen = false; render(); // B3d: freeze, don't call transfers stalled
     setTimeout(connect, retryMs);
     retryMs = Math.min(retryMs * 2, 15000);
   };
@@ -135,6 +149,11 @@ function applySnapshot(list) {
   render();
 }
 
+// B3c: who a waiting transfer waits for (old servers send no wait_for: sender).
+function waitWho(t) {
+  return t.wait_for === 'receiver' ? 'receiver' : 'sender';
+}
+
 function applyUpdate(t, fromSnapshot = false) {
   const now = Date.now();
   const prev = transfers.get(t.id);
@@ -148,20 +167,25 @@ function applyUpdate(t, fromSnapshot = false) {
   // Log what changed.
   if (!prev) {
     log(cur, cur.path ? `started (${cur.path})` : 'started', cur.path || 'pending');
-  } else if (cur.path && cur.path !== prev.path) {
+  } else if (cur.path && cur.path !== prev.path && cur.path !== 'none') { // B3d: 'none' is not a path
     log(cur, prev.path ? `path ${prev.path} -> ${cur.path}` : `path ${cur.path}`, cur.path);
   }
   // B3b: connection lost / sender gone / sender back.
   if (cur.state === 'retrying' && (!prev || prev.state !== 'retrying')) {
     log(cur, `reconnecting (at ${cur.pct || 0}%)`, 'retrying');
-  } else if (cur.state === 'waiting' && (!prev || prev.state !== 'waiting')) {
-    log(cur, `waiting for sender (${minutesLeft(cur, now)} min left, ${cur.pct || 0}% kept)`, 'waiting');
+  } else if (cur.state === 'waiting' && (!prev || prev.state !== 'waiting' || prev.wait_for !== cur.wait_for)) {
+    log(cur, `waiting for ${waitWho(cur)} (${minutesLeft(cur, now)} min left, ${cur.pct || 0}% kept)`, 'waiting');
   } else if (prev && (prev.state === 'waiting' || prev.state === 'retrying') && cur.state === 'moving') {
     log(cur, prev.state === 'waiting' ? `resumed from ${cur.pct || 0}%` : 'reconnected', cur.path || 'direct');
   }
   if (isFinal(cur.state)) {
     cur.finishedAt = now;
-    if (cur.state === 'done') { doneCount++; log(cur, `done (${cur.path || '?'})`, cur.path || 'direct'); }
+    if (cur.state === 'done') {
+      doneCount++;
+      // B3d: path "none" = nothing was sent, the receiver already had the file.
+      if (alreadyHad(cur)) log(cur, 'done (already had it)', 'pending');
+      else log(cur, `done (${cur.path || '?'})`, cur.path || 'direct');
+    }
     else { failedCount++; log(cur, `failed: ${cur.reason || 'unknown'}`, 'failed'); }
   }
   transfers.set(cur.id, cur);
@@ -169,11 +193,23 @@ function applyUpdate(t, fromSnapshot = false) {
 }
 
 const isFinal = (s) => s === 'done' || s === 'failed';
+const alreadyHad = (t) => t.state === 'done' && t.path === 'none';
+
+// B3d: users that waiting transfers wait for, and nothing shows active.
+function awayUsers() {
+  const waitedFor = new Set(), active = new Set();
+  for (const t of transfers.values()) {
+    if (t.state === 'waiting') waitedFor.add(t.wait_for === 'receiver' ? t.to : t.from);
+    else if (t.state === 'moving' || t.state === 'started') { active.add(t.from); active.add(t.to); }
+  }
+  return new Set([...waitedFor].filter(u => !active.has(u)));
+}
 function touchNode(name, now) { if (name) nodesLastSeen.set(name, now); }
 
 function isStalled(t, now) {
-  // B3b: a waiting or retrying transfer is quiet on purpose — not stalled.
-  return !isFinal(t.state) && t.state !== 'waiting' && t.state !== 'retrying'
+	  // B3b: a waiting or retrying transfer is quiet on purpose — not stalled.
+	  // B3d: no news because the MESH is disconnected is not "stalled" either.
+	  return wsOpen && !isFinal(t.state) && t.state !== 'waiting' && t.state !== 'retrying'
     && now - t.seenAt > STALLED_AFTER_MS;
 }
 
@@ -193,6 +229,7 @@ function el(name, attrs, parent) {
 
 function colorOf(t, now) {
   if (t.state === 'failed') return 'failed';
+  if (alreadyHad(t)) return 'pending';
   if (t.state === 'waiting') return 'waiting';
   if (t.state === 'retrying') return 'retrying';
   if (isStalled(t, now) || !t.path) return 'pending';
@@ -262,9 +299,10 @@ function render() {
         'stroke-dasharray': dash, 'marker-end': `url(#arrow-${c})`,
         opacity: finished ? 0.55 : 1
       }, edges);
-      const label = t.state === 'done' ? 'done'
+      const label = alreadyHad(t) ? 'already had it'
+        : t.state === 'done' ? 'done'
         : t.state === 'failed' ? 'failed'
-        : t.state === 'waiting' ? `waiting · ${minutesLeft(t, now)} min left`
+        : t.state === 'waiting' ? `waiting for ${waitWho(t)} · ${minutesLeft(t, now)} min left`
         : t.state === 'retrying' ? `reconnecting ${t.retry || ''}`.trim()
         : isStalled(t, now) ? 'stalled'
         : t.pct > 0 ? t.pct + '%' : (t.path || 'starting');
@@ -274,13 +312,24 @@ function render() {
   }
 
   const nodes = el('g', {}, svg);
+  const away = awayUsers(); // B3d
   for (const n of names) {
     const p = pos.get(n);
-    el('circle', { cx: p.x, cy: p.y, r: 18, fill: 'var(--panel)', stroke: 'var(--node)', 'stroke-width': 2 }, nodes);
-    const label = el('text', { x: p.x, y: p.y + 34, 'text-anchor': 'middle' }, nodes);
-    label.textContent = shortName(n);
+    const off = away.has(n);
+    const g = el('g', { opacity: off ? 0.45 : 1 }, nodes);
+    el('circle', { cx: p.x, cy: p.y, r: 18, fill: 'var(--panel)',
+      stroke: off ? 'var(--muted)' : 'var(--node)', 'stroke-width': 2,
+      'stroke-dasharray': off ? '4 3' : '' }, g);
+    const label = el('text', { x: p.x, y: p.y + 34, 'text-anchor': 'middle' }, g);
+    label.textContent = shortName(n) + (off ? ' (offline)' : '');
     const title = el('title', {}, label);
-    title.textContent = n;
+    title.textContent = off ? n + ' is offline; a transfer is waiting for them' : n;
+  }
+  // B3d: mesh lost its server connection: show the last known state, dimmed.
+  if (!wsOpen && wasConnected) {
+    edges.setAttribute('opacity', '0.35'); nodes.setAttribute('opacity', '0.35');
+    const b = el('text', { x: 500, y: 40, 'text-anchor': 'middle', class: 'label' }, svg);
+    b.textContent = 'mesh offline · server unreachable · showing the last known state';
   }
   if (names.length === 0) {
     const t = el('text', { x: 500, y: 350, 'text-anchor': 'middle', class: 'label' }, svg);
@@ -308,7 +357,7 @@ function renderSide(now) {
     const c = colorOf(t, now);
     right.className = 'c-' + c;
     right.textContent = t.state === 'waiting'
-      ? `waiting ${minutesLeft(t, now)} min` + (t.pct > 0 ? ` (${t.pct}% kept)` : '')
+      ? `waiting for ${waitWho(t)} ${minutesLeft(t, now)} min` + (t.pct > 0 ? ` (${t.pct}% kept)` : '')
       : t.state === 'retrying'
       ? `reconnecting ${t.retry || ''}`.trim() + (t.pct > 0 ? ` (${t.pct}%)` : '')
       : (isStalled(t, now) ? 'stalled' : (t.path || 'starting')) + (t.pct > 0 ? ` ${t.pct}%` : '');

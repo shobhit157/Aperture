@@ -182,6 +182,10 @@ public class ClientHandler implements Runnable {
             // Step 5: send the current online list (all pods) right away.
             sendOnlineList();
 
+            // B3c: and this user's active transfers, so a client that just
+            // restarted can compare them with what its peer-app restored.
+            sendMyTransfers();
+
             long lastHeardAt = System.currentTimeMillis();
             long lastOwnershipCheckAt = System.currentTimeMillis();
 
@@ -282,7 +286,9 @@ public class ClientHandler implements Runnable {
                 }
 
                 // Mesh v2 S3: if this user really left (and doesn't come
-                // back within the grace period), their transfers fail.
+                // back within the grace period), the tracker updates their
+                // transfers (B3c: as receiver they become "waiting for
+                // receiver"; as sender the receiver decides).
                 if (wasOwner && transfers != null) {
                     transfers.userLeft(username);
                 }
@@ -330,6 +336,20 @@ public class ClientHandler implements Runnable {
         } catch (Exception e) {
             System.out.println("[SESSION] user=" + username + " session=" + sessionId
                     + " could not send online list: " + e.getMessage());
+        }
+    }
+
+    // B3c: MY_TRANSFER|<id>|<state>|<from>|<to>|<pct> lines, then
+    // MY_TRANSFERS_END|<count>. Sent on every login (also reconnects).
+    private void sendMyTransfers() {
+        if (transfers == null) return;
+        try {
+            for (String l : transfers.myTransferLines(username)) {
+                out.println(l);
+            }
+        } catch (Exception e) {
+            System.out.println("[SESSION] user=" + username + " session=" + sessionId
+                    + " could not send my transfers: " + e.getMessage());
         }
     }
 

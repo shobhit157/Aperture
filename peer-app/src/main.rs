@@ -6,6 +6,8 @@
 //!   - iroh-blobs: "share, then fetch" (B2)
 //! B2b-1: offers and fetches are saved, so transfers survive restarts.
 //! B2b-2: failed fetches wait for `retry`; `cancel`; 30 min expiry.
+//! B3c: after a restart, saved fetches wait for Java's `retry` / `cancel`
+//! (Java checks with the server first); every restored item is reported.
 
 mod blobs;
 mod identity;
@@ -63,6 +65,7 @@ async fn main() -> Result<()> {
     }
 
     // B2b-1: offers come back before anyone can connect.
+    // B3c: kept as a list and reported below, together with the fetches.
     let offers_restored = blobs.restore_offers().await;
 
     // One endpoint, two protocols. The Router sets the endpoint's ALPNs.
@@ -86,9 +89,17 @@ async fn main() -> Result<()> {
     // B2b-2: how long shares and fetches live. Java ignores it.
     println!("EVENT:TRANSFER_TTL:{}", blobs::transfer_ttl_secs());
 
-    // B2b-1: unfinished fetches continue once we are online.
-    let fetches_restored = blobs.restore_fetches();
-    println!("EVENT:RESTORED:{offers_restored}:{fetches_restored}");
+    // B3c: unfinished fetches are found but NOT started; they wait for
+    // `retry` / `cancel` from Java. One line per restored item, then the
+    // summary, which Java treats as "list complete".
+    let fetches_restored = blobs.restore_fetches().await;
+    for offer in &offers_restored {
+        println!("{}", offer.event_line());
+    }
+    for fetch in &fetches_restored {
+        println!("{}", fetch.event_line());
+    }
+    println!("EVENT:RESTORED:{}:{}", offers_restored.len(), fetches_restored.len());
 
     // B2b-2: clean up expired shares and fetches every few seconds.
     blobs.start_expiry();

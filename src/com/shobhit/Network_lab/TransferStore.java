@@ -15,12 +15,16 @@ import java.util.Map;
  *   transfer:<id>      hash: from, to, state, path, pct, reason, created_at, updated_at
  *                      B3b: + wait_until, wait_reason while state = waiting
  *                           + retry ("2/3") while state = retrying
+ *                      B3c: + wait_for ("sender" | "receiver") while waiting
  *   transfers:active   sorted set: active ids, score = updated_at (ms)
  *   mesh:changed       pub/sub channel: "<id>" whenever a transfer changes
  *
  * States: started -> moving -> done | failed
  *         B3b: moving -> retrying (peer-app's quick tries) -> waiting
  *              (sender gone, receiver keeps its chunks) -> moving (resumed)
+ *         B3c: receiver gone (after the 30 s grace) -> waiting for receiver
+ *              until created_at + TTL -> moving when it is back, or failed
+ *              (expired) by the sweeper
  *
  * Every change is ONE Lua script, so it is atomic even when several pods
  * write the same transfer at the same moment.
@@ -63,9 +67,10 @@ public class TransferStore {
             "return 1";
 
     // KEYS[1]=transfer:<id>  KEYS[2]=transfers:active
-    // ARGV: 1 id, 2 event (path|progress|retrying|waiting|done|failed), 3 path, 4 pct,
-    //       5 reason (for retrying: "n/3"), 6 finishedTtl, 7 channel,
-    //       8 user ('' = server itself), 9 waitSecs (only for 'waiting')
+    // ARGV: 1 id, 2 event (path|progress|retrying|waiting|receiver_left|done|failed),
+    //       3 path, 4 pct, 5 reason (for retrying: "n/3"), 6 finishedTtl, 7 channel,
+    //       8 user ('' = server itself), 9 waitSecs ('waiting': seconds from now;
+    //       'receiver_left': the TTL, counted from created_at)
     // Returns 0 ignored, 1 changed, 2 became done, 3 became failed.
     private static final String APPLY_SCRIPT =
             NOW_MS +
@@ -88,10 +93,10 @@ public class TransferStore {
             "  end " +
             "  redis.call('HSET', KEYS[1], 'state', 'moving', 'path', ARGV[3], 'updated_at', now) " +
             // B3b: moving again after retrying/waiting (same transfer id, resumed).
-            "  redis.call('HDEL', KEYS[1], 'wait_until', 'wait_reason', 'retry') " +
+            "  redis.call('HDEL', KEYS[1], 'wait_until', 'wait_reason', 'wait_for', 'retry') " +
             "elseif ev == 'progress' then " +
             "  redis.call('HSET', KEYS[1], 'state', 'moving', 'pct', ARGV[4], 'updated_at', now) " +
-            "  redis.call('HDEL', KEYS[1], 'wait_until', 'wait_reason', 'retry') " +
+            "  redis.call('HDEL', KEYS[1], 'wait_until', 'wait_reason', 'wait_for', 'retry') " +
             "elseif ev == 'retrying' then " +
             // B3b: peer-app's quick tries (sender unreachable). Also keeps
             // the record alive for the sweeper. wait_until is kept if set.
@@ -101,15 +106,32 @@ public class TransferStore {
             "  local secs = tonumber(ARGV[9]) or 0 " +
             "  local wu = now + secs * 1000 " +
             "  redis.call('HSET', KEYS[1], 'state', 'waiting', 'wait_until', wu, " +
-            "    'wait_reason', ARGV[5], 'updated_at', now) " +
+            "    'wait_reason', ARGV[5], 'wait_for', 'sender', 'updated_at', now) " +
             "  redis.call('HDEL', KEYS[1], 'retry') " +
+            "elseif ev == 'receiver_left' then " +
+            // B3c: only the server may send this (a client could fake it).
+            // The receiver gets the same time as a sender: until
+            // created_at + TTL (same clock as peer-app's own expiry).
+            "  if ARGV[8] ~= '' then return 0 end " +
+            "  local created = tonumber(redis.call('HGET', KEYS[1], 'created_at')) or now " +
+            "  local wu = created + (tonumber(ARGV[9]) or 0) * 1000 " +
+            "  if now >= wu then " +
+            "    ev = 'failed' " +
+            "    redis.call('HSET', KEYS[1], 'state', 'failed', 'reason', 'expired (receiver did not come back)', " +
+            "      'updated_at', now) " +
+            "    redis.call('HDEL', KEYS[1], 'wait_until', 'wait_reason', 'wait_for', 'retry') " +
+            "  else " +
+            "    redis.call('HSET', KEYS[1], 'state', 'waiting', 'wait_until', wu, " +
+            "      'wait_reason', 'receiver offline', 'wait_for', 'receiver', 'updated_at', now) " +
+            "    redis.call('HDEL', KEYS[1], 'retry') " +
+            "  end " +
             "elseif ev == 'done' then " +
             "  redis.call('HSET', KEYS[1], 'state', 'done', 'pct', '100', 'updated_at', now) " +
             "  if ARGV[3] ~= '' then redis.call('HSET', KEYS[1], 'path', ARGV[3]) end " +
-            "  redis.call('HDEL', KEYS[1], 'wait_until', 'wait_reason', 'retry') " +
+            "  redis.call('HDEL', KEYS[1], 'wait_until', 'wait_reason', 'wait_for', 'retry') " +
             "elseif ev == 'failed' then " +
             "  redis.call('HSET', KEYS[1], 'state', 'failed', 'reason', ARGV[5], 'updated_at', now) " +
-            "  redis.call('HDEL', KEYS[1], 'wait_until', 'wait_reason', 'retry') " +
+            "  redis.call('HDEL', KEYS[1], 'wait_until', 'wait_reason', 'wait_for', 'retry') " +
             "else " +
             "  return 0 " +
             "end " +
@@ -129,7 +151,8 @@ public class TransferStore {
     //
     // KEYS[1]=transfer:<id>  KEYS[2]=transfers:active
     // ARGV: 1 id, 2 silentMs, 3 waitMarginMs, 4 reason (silent),
-    //       5 reason (waited too long), 6 finishedTtl, 7 channel
+    //       5 reason (waited too long for the sender), 6 finishedTtl, 7 channel,
+    //       8 reason (waited too long for the receiver, B3c)
     // Returns 3 if this call failed it, else 0.
     private static final String SILENT_FAIL_SCRIPT =
             NOW_MS +
@@ -145,10 +168,14 @@ public class TransferStore {
             "if state == 'waiting' then " +
             "  local wu = tonumber(redis.call('HGET', KEYS[1], 'wait_until')) or 0 " +
             "  if now < wu + tonumber(ARGV[3]) then return 0 end " +
-            "  reason = ARGV[5] " +
+            "  if redis.call('HGET', KEYS[1], 'wait_for') == 'receiver' then " +
+            "    reason = ARGV[8] " +
+            "  else " +
+            "    reason = ARGV[5] " +
+            "  end " +
             "end " +
             "redis.call('HSET', KEYS[1], 'state', 'failed', 'reason', reason, 'updated_at', now) " +
-            "redis.call('HDEL', KEYS[1], 'wait_until', 'wait_reason', 'retry') " +
+            "redis.call('HDEL', KEYS[1], 'wait_until', 'wait_reason', 'wait_for', 'retry') " +
             "redis.call('ZREM', KEYS[2], ARGV[1]) " +
             "redis.call('EXPIRE', KEYS[1], ARGV[6]) " +
             "redis.call('PUBLISH', ARGV[7], ARGV[1]) " +
@@ -197,16 +224,19 @@ public class TransferStore {
 
     /**
      * B3b: fails a transfer that has been silent for silentMs — unless it is
-     * waiting for its sender and wait_until + waitMarginMs has not passed.
+     * waiting (for its sender, or B3c: for its receiver) and
+     * wait_until + waitMarginMs has not passed.
      */
     public Result failIfSilent(String id, long silentMs, long waitMarginMs,
-                               String silentReason, String waitedReason) {
+                               String silentReason, String waitedSenderReason,
+                               String waitedReceiverReason) {
         try (Jedis jedis = pool.getResource()) {
             Object r = jedis.eval(SILENT_FAIL_SCRIPT,
                     List.of(key(id), ACTIVE_KEY),
                     List.of(id, String.valueOf(silentMs), String.valueOf(waitMarginMs),
-                            nz(silentReason), nz(waitedReason),
-                            String.valueOf(FINISHED_TTL_SECONDS), CHANGED_CHANNEL));
+                            nz(silentReason), nz(waitedSenderReason),
+                            String.valueOf(FINISHED_TTL_SECONDS), CHANGED_CHANNEL,
+                            nz(waitedReceiverReason)));
             return toResult(r);
         }
     }
@@ -216,6 +246,28 @@ public class TransferStore {
         try (Jedis jedis = pool.getResource()) {
             return jedis.hgetAll(key(id));
         }
+    }
+
+    /**
+     * B3c: the active transfers (not done / failed) where this user is the
+     * sender or the receiver, for MY_TRANSFERS on login. A scan of
+     * transfers:active is fine for now (small); later a per-user index.
+     */
+    public List<Map<String, String>> activeFor(String user) {
+        List<Map<String, String>> mine = new ArrayList<>();
+        if (user == null || user.isEmpty()) return mine;
+        try (Jedis jedis = pool.getResource()) {
+            for (String id : jedis.zrange(ACTIVE_KEY, 0, -1)) {
+                Map<String, String> t = jedis.hgetAll(key(id));
+                if (t == null || t.isEmpty()) continue;
+                String state = t.get("state");
+                if ("done".equals(state) || "failed".equals(state)) continue;
+                if (user.equals(t.get("from")) || user.equals(t.get("to"))) {
+                    mine.add(t);
+                }
+            }
+        }
+        return mine;
     }
 
     /** All active transfer ids. */
