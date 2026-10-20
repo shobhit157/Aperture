@@ -734,6 +734,7 @@ public class Client {
             boolean peerAway = false;   // B3d: send, the receiver left while we serve
             
             long lockedUntil = 0;       // B3d: receive, waiting: when peer-app gives up (0 = unknown)
+            long resumedShown = -1;     // B3d: bytes in the last "resuming from" line (print each value once)
 
             Transfer(String id, Dir dir, String peer, String name, String filePath, long size) {
                 this.id = id;
@@ -783,6 +784,7 @@ public class Client {
         // B3c: restart sync state (all under lock).
         private final Map<String, Restored> restored = new LinkedHashMap<>();
         private final Map<String, String> droppedAtStart = new HashMap<>(); // id -> why peer-app dropped it
+        private final Map<String, String> droppedNames = new HashMap<>();   // B3d: id -> file name (for messages)
         private boolean restoreListDone = false;           // EVENT:RESTORED seen
         private List<String[]> serverBuilding = new ArrayList<>();
         private List<String[]> serverList = null;          // complete MY_TRANSFERS list
@@ -993,6 +995,7 @@ public class Client {
                     if (!synced) {
                         restored.remove(id);
                         droppedAtStart.put(id, rawReason);
+                        if (!fileName.isEmpty()) droppedNames.put(id, fileName); // B3d
                         // B3d: show WHICH file (also covers offers that
                         // expired while peer-app was off).
                         say("[restart] saved share " + (fileName.isEmpty() ? "" : fileName + " ")
@@ -1298,7 +1301,12 @@ public class Client {
                 String[] kv = idAndRest(line, "EVENT:RESUMED:");
                 synchronized (lock) {
                     Transfer t = byId.get(kv[0]);
-                    if (t != null) say(arrow(t) + "   resuming from " + human(parseLong(kv[1])));
+                    long bytes = parseLong(kv[1]);
+                    // B3d: every quick retry reports RESUMED; show it only when the number changed.
+                    if (t != null && bytes != t.resumedShown) {
+                        t.resumedShown = bytes;
+                        say(arrow(t) + "   resuming from " + human(bytes));
+                    }
                 }
                 return true;
             }
@@ -1377,7 +1385,12 @@ public class Client {
                     || line.startsWith("EVENT:ERROR:cancel ")
                     // B3b: SERVED and TRANSFER_END both unshare; the second
                     // one finds no offer. Harmless, so not shown.
-                    || line.startsWith("EVENT:ERROR:unshare: no offer");
+                    || line.startsWith("EVENT:ERROR:unshare: no offer")
+                    // B3d: peer-app refused a request for a share it no longer has
+                    // (e.g. dropped after a restart); the other side is told anyway.
+                    || line.startsWith("EVENT:PEER_REJECTED:")
+                    // B3d: peer-app stopping because we exit.
+                    || line.startsWith("EVENT:SHUTDOWN:");
         }
 
         private void onProgress(String id, int pct) {
@@ -1547,7 +1560,8 @@ public class Client {
                         : !begun ? "restarted before the transfer began"
                         : "lost local data";
                 reportFailed(id, other, reason);
-                String name = r != null ? r.name : "transfer " + shortId(id);
+                String name = r != null ? r.name
+                        : droppedNames.getOrDefault(id, "transfer " + shortId(id)); // B3d: name if peer-app told us
                 say("[restart] " + name + (iAmSender ? " -> " : " <- ") + other + "   FAILED " + reason);
             }
 
@@ -1559,6 +1573,7 @@ public class Client {
             }
             restored.clear();
             droppedAtStart.clear();
+            droppedNames.clear(); // B3d
             serverList = null;
         }
 

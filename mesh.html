@@ -92,6 +92,11 @@
  * B3d: the user a transfer waits for is drawn faded ("offline"), unless
  * another transfer shows them active. A receiver that already had the file
  * finishes with path "none": shown as "already had it", not as a path.
+ 
+ * B3d: when the mesh page itself loses the server (WebSocket closed), it keeps
+ * the last known state, dimmed, with a note, instead of calling every
+ * transfer "stalled".
+ *
  *
  * Everything is keyed by transfer id. Each transfer is its own line, so two
  * transfers between the same users (or opposite directions) are drawn apart.
@@ -112,11 +117,13 @@ let doneCount = 0, failedCount = 0;
 
 // ---------------- WebSocket (auto-reconnect) ----------------
 let ws, retryMs = 1000;
+let wsOpen = false, wasConnected = false; // B3d: is the mesh itself connected?
 function connect() {
   ws = new WebSocket('ws://' + location.hostname + ':' + WS_PORT);
-  ws.onopen = () => { setStatus('connected', 'ok'); retryMs = 1000; };
+  ws.onopen = () => { setStatus('connected', 'ok'); retryMs = 1000; wsOpen = wasConnected = true; render(); };
   ws.onclose = () => {
     setStatus('disconnected - retrying', 'bad');
+    wsOpen = false; render(); // B3d: freeze, don't call transfers stalled
     setTimeout(connect, retryMs);
     retryMs = Math.min(retryMs * 2, 15000);
   };
@@ -200,8 +207,9 @@ function awayUsers() {
 function touchNode(name, now) { if (name) nodesLastSeen.set(name, now); }
 
 function isStalled(t, now) {
-  // B3b: a waiting or retrying transfer is quiet on purpose — not stalled.
-  return !isFinal(t.state) && t.state !== 'waiting' && t.state !== 'retrying'
+	  // B3b: a waiting or retrying transfer is quiet on purpose — not stalled.
+	  // B3d: no news because the MESH is disconnected is not "stalled" either.
+	  return wsOpen && !isFinal(t.state) && t.state !== 'waiting' && t.state !== 'retrying'
     && now - t.seenAt > STALLED_AFTER_MS;
 }
 
@@ -316,6 +324,12 @@ function render() {
     label.textContent = shortName(n) + (off ? ' (offline)' : '');
     const title = el('title', {}, label);
     title.textContent = off ? n + ' is offline; a transfer is waiting for them' : n;
+  }
+  // B3d: mesh lost its server connection: show the last known state, dimmed.
+  if (!wsOpen && wasConnected) {
+    edges.setAttribute('opacity', '0.35'); nodes.setAttribute('opacity', '0.35');
+    const b = el('text', { x: 500, y: 40, 'text-anchor': 'middle', class: 'label' }, svg);
+    b.textContent = 'mesh offline · server unreachable · showing the last known state';
   }
   if (names.length === 0) {
     const t = el('text', { x: 500, y: 350, 'text-anchor': 'middle', class: 'label' }, svg);
