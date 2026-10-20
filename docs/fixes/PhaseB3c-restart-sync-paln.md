@@ -183,3 +183,19 @@ Same setup and cases as the [findings](../problems/Before-PhaseB3c-restart-sync-
 - Mesh "% kept" (R9): send `pct` with retrying / waiting.
 - "already had it" instead of `done (none)`.
 - Fade the offline peer's node on the mesh while its transfer is waiting.
+
+---
+
+## Results (EC2 tests, Oct 2026)
+
+| Case | Result |
+|---|---|
+| 2, 3, 5, 7 | ✅ (images `:b3c`; Case 2 and 3 hashes match) |
+| 4 | ✅ hash re-checked after B3d: `24b76c39…3ad8` original = received |
+| E1 – plain reconnect does not re-run the comparison | ✅ (seen in the B3d T6 test) |
+| Sender restart with a saved offer | ✅ `restored, still sharing` → resumed (B3d T3) |
+| Receiver restart with a saved fetch | ✅ `restored (71% kept)` → resumed (B3d T4) |
+| Offer dropped because the file changed | ✅ receiver told `file changed while peer-app was off` (B3d T5) |
+| 1, E2 | ⏭ not run yet (parked in the roadmap) |
+
+The B3c tests also found the "first try always fails" bug, unclear messages and missing states → fixed in B3d: `docs/fixes/PhaseB3d-cleanup.md`.
