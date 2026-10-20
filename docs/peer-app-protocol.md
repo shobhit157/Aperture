@@ -297,3 +297,29 @@ flowchart LR
   sender is back (→ `retry`).
 - **B5:** META3 (Part 3) is removed.
 - See `docs/future-plans/File-transfer-improvement-plan.md`.
+
+---
+
+## Part 5 – B3c / B3d additions
+
+### Events (peer-app → Java)
+
+| Event | When | Java does |
+|---|---|---|
+| `RESTORED_OFFER:<id>:<hash>:<size>:<name>` | at start, a saved share came back | keeps it until the restart check |
+| `RESTORED_FETCH:<id>:<hash>:<size>:<bytes_on_disk>:<name>` | at start, a saved fetch came back (**not** started by itself) | `retry <id>` (resume) or `cancel <id>` after the check |
+| `RESTORED:<offers>:<fetches>` | the restored list is complete | runs the restart check once both lists are in |
+| `OFFER_DROPPED:<id>:<reason>\|<name>` | a saved share could not be kept: `file changed while peer-app was off`, file gone, or `expired while peer-app was off` | shows the name; tells the receiver it failed |
+| `FETCH_RETRYING:<id>:<n>:<secs>:<reason>` | quick try n of 3 (5 / 10 / 20 s). B3d: n starts again at 1 when data moved since the last try | mesh "reconnecting n/3" (latest % sent first) |
+| `FETCH_WAITING:<id>:<secs_left>:<reason>` | 3 tries failed, chunks kept | 🔒 locked; mesh "waiting for sender" (latest % sent first) |
+| `RESUMED:<id>:<bytes>` | a fetch continues from bytes already on disk | shown once per value |
+| `PEER_REJECTED:<endpoint>:…` | a request for a share this peer-app doesn't have / doesn't allow | quiet |
+| `SHUTDOWN:<why>` | peer-app stopping | quiet |
+
+### Timing (B3d)
+- Downloader connect timeout: **10 s** (iroh-blobs default was 1 s → first try failed).
+- Quick tries: 5 s, 10 s, 20 s, then `FETCH_WAITING` until the TTL (`PEER_TRANSFER_TTL_SECS`, default 30 min).
+
+### Client side (Java, for reference)
+- Waits up to **60 s** for `ENDPOINT_READY` + `RELAY_READY`, otherwise exits with code **4**.
+- Exit codes: `3` username taken · `4` peer-app never ready · `5` server unreachable longer than `RECONNECT_GIVE_UP_SECS` (default 600).
