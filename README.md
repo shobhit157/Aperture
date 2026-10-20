@@ -66,12 +66,27 @@ The **control plane** helps peers find each other and keeps track of who's onlin
 
 ---
 
+## What happens when things break
+
+Each of these was tested on purpose, with a hash check at the end.
+
+| What breaks | What happens |
+|---|---|
+| The sender closes the app halfway | The receiver tries 3 times, then waits with its data **locked** on disk. When the sender is back, it continues from the same %. |
+| The receiver closes the app halfway | The sender keeps sharing for up to 30 min. When the receiver is back, it restores its pieces and continues. |
+| Either side restarts | Both sides compare what they remember with the server, then **resume, clean up, or report a clear failure**. Nothing stays stuck. |
+| The file changes while the sender is offline | The transfer is stopped, and the receiver is told why. |
+| **The server goes down** | Transfers **keep going directly**. Results are kept and sent when the server is back, so its records stay correct. |
+| The server is gone for good | The client gives up after 10 minutes with a clear message. Saved transfers resume on the next start. |
+
+---
+
 ## What's inside
 
 - **A signaling server** (Java) running as several pods on Kubernetes, sharing state through Redis and AWS messaging
 - **A peer app** (Rust, on Iroh) that does the actual connecting and file moving
 - **Bots** that join, chat and send files to each other, so the system is always busy
-- **A live mesh view** showing who's talking to whom, and whether it went direct or through a relay
+- **A live mesh view** showing who's talking to whom, whether it went direct or through a relay, and who is offline
 
 ---
 
@@ -79,10 +94,12 @@ The **control plane** helps peers find each other and keeps track of who's onlin
 
 ```mermaid
 flowchart LR
-  C[Reconnects] --> A[Honest transfers] --> M[Live mesh] --> I[Persistent identity] --> B[Resumable transfers] --> N[...]
+  C[Reconnects] --> A[Honest transfers] --> M[Live mesh] --> I[Persistent identity] --> B[Resumable transfers] --> R[Restart sync] --> O[Survives server outages] --> D[Dashboard ...]
 ```
 
 Each step started with something that broke, and ended with a test proving it was fixed.
+
+**Now:** file transfer on iroh-blobs is done (Phase B3). **Next:** a live dashboard for the whole system. See the [roadmap](docs/roadmap.md).
 
 ---
 
@@ -105,4 +122,4 @@ Rust · Iroh · Java · Redis · AWS SNS/SQS · Docker · Kubernetes (k3s) · Pr
 
 The full story (problems, fixes, decisions, experiments) lives in [`docs/`](docs/). The [roadmap](docs/roadmap.md) shows where it's heading next.
 
-*Tested with a handful of peers across my laptop and a cloud machine. Not production software, and not trying to be.*
+*Tested with a handful of peers across my laptop and a cloud machine (k3s, two server pods). Not production software, and not trying to be.*
