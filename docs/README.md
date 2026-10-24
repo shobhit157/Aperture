@@ -103,7 +103,7 @@ flowchart LR
 | [reconnect-step3-fix.md](fixes/chat-reconnect/reconnect-step3-fix.md) | Client-side reconnect fixes |
 | [Process-ownership.md](fixes/chat-reconnect/Process-ownership.md) | Same username in two processes: newest wins |
 | [mesh-v2.md](fixes/mesh-v2.md) | Live transfer tracking + client limits |
-| [PhaseB3c-restart-sync-paln.md](fixes/PhaseB3c-restart-sync-paln.md) | B3c: after a restart, client, peer-app and server agree (resume / clean up / report failed) + test results |
+| [PhaseB3c-restart-sync-plan.md](fixes/PhaseB3c-restart-sync-plan.md) | B3c: after a restart, client, peer-app and server agree (resume / clean up / report failed) + test results |
 | [PhaseB3d-cleanup.md](fixes/PhaseB3d-cleanup.md) | B3d: first-try fix, locked state, clearer messages, startup watchdog, give-up, surviving server outages, mesh offline view + EC2 test results and known issues |
 
 ---

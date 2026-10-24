@@ -19,3 +19,4 @@ peer-bug-check-*/
 .aperture/
 *.key
 *.key.tmp
+k8s-dummy-client.yaml

@@ -127,7 +127,7 @@ Each side writes **its half** of the transfer to its data folder. The **receiver
 After a restart peer-app remembers its transfers but the Java client forgets them, and the server gives a receiver only 30 s. Fix: the receiver's restored download waits for Java; the server sends `MY_TRANSFERS` on login; Java compares both lists (go / delete / report failed); a receiver that leaves gets 30 min like a sender.
 
 - Findings (7 cases before B3c): [Before-PhaseB3c-restart-sync-findings.md](../problems/Before-PhaseB3c-restart-sync-findings.md)
-- Fix design: [PhaseB3c-restart-sync-paln.md](../fixes/PhaseB3c-restart-sync-paln.md)
+- Fix design: [PhaseB3c-restart-sync-plan.md](../fixes/PhaseB3c-restart-sync-plan.md)
 ### Open questions
 
 | Question | Options | Decide in |
